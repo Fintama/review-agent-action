@@ -1,0 +1,96 @@
+# ──────────────────────────────────────────────────────────────
+# Example: Swisper (FastAPI + LangGraph + React monorepo)
+#
+# Place this at .github/review-agent/config.yaml in your repo.
+# ──────────────────────────────────────────────────────────────
+
+project:
+  name: "Swisper"
+  description: "AI personal assistant built with FastAPI, LangGraph, and React/TypeScript"
+  tech_stack: "FastAPI, LangGraph, React, TypeScript, SQLModel, PostgreSQL"
+
+rules:
+  enabled: true
+  directory: ".cursor/rules"
+  file_pattern: "*.mdc"
+  always_include:
+    - "00-workflow"
+    - "02-planning"
+    - "03-pull-requests"
+
+docs:
+  enabled: true
+  spec_dirs:
+    - "docs/specs"
+    - "docs/plans"
+  directory_doc_map:
+    "swisper/agents/supervisor/":
+      - "docs/Documentation/GLOBAL_SUPERVISOR.md"
+      - "docs/Documentation/INTENT_CLASSIFICATION.md"
+    "swisper/agents/productivity/":
+      - "docs/architecture/ENhanced_prod_agent_COMPONENT_ARCHITECTURE_v1.md"
+    "swisper/agents/research/":
+      - "docs/architecture/Enhanced_Research_Agent_Target_Architecture.md"
+    "swisper/services/voice/":
+      - "docs/Documentation/VOICE_SYSTEM.md"
+    "swisper/models/state/":
+      - "docs/Documentation/GLOBAL_SUPERVISOR.md"
+    "swisper/api/routes/":
+      - "docs/Documentation/SWISPER_ARCHITECTURE.md"
+    ".cursor/rules/":
+      - "AGENTS.md"
+
+blast_radius:
+  enabled: true
+  language: "auto"
+  source_dirs:
+    - "apps/backend"
+  module_prefix_strip: "apps/backend/"
+  max_files: 10
+
+risk:
+  structural_paths:
+    - "alembic"
+    - "migrations/"
+    - "persistence/models/"
+    - "models/state/"
+    - "api/routes/"
+  security_paths:
+    - "auth/"
+    - "security/"
+    - "middleware/"
+    - "core/config.py"
+    - "core/security.py"
+    - "2fa/"
+    - "encryption"
+  security_dep_files:
+    - "pyproject.toml"
+    - "package.json"
+    - "package-lock.json"
+    - "requirements.txt"
+    - "pnpm-lock.yaml"
+  infrastructure_patterns:
+    - "docker-compose"
+    - "Dockerfile"
+    - ".github/workflows/"
+  domain_paths:
+    "agents/supervisor/": "supervisor"
+    "agents/productivity/": "productivity"
+    "agents/research/": "research"
+    "agents/wealth/": "wealth"
+    "services/": "services"
+    "gateways/": "gateways"
+    "api/": "api"
+    "apps/frontend": "frontend"
+  thresholds:
+    max_code_files: 15
+    max_code_lines: 1000
+    cross_cutting_domains: 3
+
+review:
+  auto_approve_enabled: true
+
+branding:
+  review_header: "## Swisper Rule Review"
+  comment_tag: "<!-- swisper-review-agent -->"
+  summary_tag: "<!-- swisper-review-agent-summary -->"

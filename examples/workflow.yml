@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────────
+# Example workflow for consuming repos
+#
+# Place this at .github/workflows/review-agent.yml in your repo.
+# ──────────────────────────────────────────────────────────────
+
+name: AI Code Review
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: "\U0001f4dd Code Review"
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: AI Review
+        uses: fintama/review-agent-action@v1
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Option A: GitHub App (recommended — reviews appear as the app identity)
+          app-id: ${{ secrets.REVIEW_APP_ID }}
+          app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          # Option B: If no GitHub App, omit app-id/app-private-key
+          # and the action uses the default GITHUB_TOKEN (reviews appear as "github-actions[bot]")

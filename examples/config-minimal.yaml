@@ -1,0 +1,19 @@
+# ──────────────────────────────────────────────────────────────
+# Example: Minimal config for a simple project
+#
+# Place this at .github/review-agent/config.yaml in your repo.
+# Most settings use sensible defaults — you only need to set
+# project identity and any project-specific risk paths.
+# ──────────────────────────────────────────────────────────────
+
+project:
+  name: "My Project"
+  description: "A web application"
+  tech_stack: "Django, PostgreSQL, React"
+
+# Rules are optional — disable if you don't have .cursor/rules/
+rules:
+  enabled: false
+
+# Use defaults for everything else — they cover common patterns
+# for risk assessment, auto-approval, etc.

@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""
+llm-review.py — Agentic PR reviewer using Claude with tool use.
+
+Generalized version: the system prompt is built from the project config
+provided by the consuming repo. The agent reads the diff, decides what
+additional context it needs, and uses tools to investigate:
+  - read_file: Read a specific file or section from the repo
+  - search_code: Grep the codebase for a pattern
+  - read_rule: Read a specific rule by ID
+  - list_directory: List files in a directory
+
+Supports dry-run mode when ANTHROPIC_API_KEY is not set.
+"""
+
+import itertools
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config_loader import load_config, get_repo_root
+
+CONTEXT_PATH = Path("/tmp/review-context.json")
+OUTPUT_PATH = Path("/tmp/review-result.json")
+REPO_ROOT = get_repo_root()
+
+# Defaults — overridable via config
+MODEL = os.environ.get("REVIEW_AGENT_MODEL", "claude-sonnet-4-20250514")
+MAX_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_TOKENS", "8192"))
+MAX_TOOL_ROUNDS = 10
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions (what Claude can call)
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {
+        "name": "read_file",
+        "description": "Read a file from the repository. You can specify line ranges to read just the relevant section. Use this to check related files, test files, callers, or any code you need context on.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to repo root",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Start line (1-indexed). Omit to read from beginning.",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "End line (1-indexed). Omit to read to end. Use with start_line to read a specific section.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "search_code",
+        "description": "Search the codebase for a pattern using grep. Returns matching files and lines. Use this to find callers of a function, usages of a class, or check if a pattern exists elsewhere.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Search pattern (basic grep regex).",
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "File glob to restrict search. E.g., '*.py', '*.tsx'. Omit to search all files.",
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "Directory to search in, relative to repo root. Omit to search entire repo.",
+                },
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "read_rule",
+        "description": "Read the full content of a specific project rule by its ID. Use this when you see a potential violation and want to check the exact rule before making a suggestion.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rule_id": {
+                    "type": "string",
+                    "description": "Rule ID (filename without extension)",
+                },
+            },
+            "required": ["rule_id"],
+        },
+    },
+    {
+        "name": "list_directory",
+        "description": "List files in a directory. Use this to check if test files exist, see the structure of a package, or find related files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path relative to repo root.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+def _validate_path(user_path: str) -> Path | None:
+    """Validate that a user-supplied path stays within REPO_ROOT."""
+    try:
+        resolved = (REPO_ROOT / user_path).resolve()
+        if not str(resolved).startswith(str(REPO_ROOT.resolve())):
+            return None
+        return resolved
+    except (ValueError, OSError):
+        return None
+
+
+def execute_tool(name: str, input_data: dict, config: dict) -> str:
+    """Execute a tool and return the result as a string."""
+    try:
+        if name == "read_file":
+            return tool_read_file(input_data)
+        elif name == "search_code":
+            return tool_search_code(input_data)
+        elif name == "read_rule":
+            return tool_read_rule(input_data, config)
+        elif name == "list_directory":
+            return tool_list_directory(input_data)
+        else:
+            return f"Unknown tool: {name}"
+    except PermissionError:
+        return f"Tool error: permission denied for {input_data}"
+    except FileNotFoundError:
+        return "Tool error: file not found"
+    except subprocess.TimeoutExpired:
+        return "Tool error: operation timed out"
+    except Exception as e:
+        return f"Tool error ({type(e).__name__}): {e}"
+
+
+def tool_read_file(input_data: dict) -> str:
+    filepath = _validate_path(input_data["path"])
+    if filepath is None:
+        return "Access denied: path is outside the repository"
+    if not filepath.exists():
+        return f"File not found: {input_data['path']}"
+    if not filepath.is_file():
+        return f"Not a file: {input_data['path']}"
+
+    start = max(0, input_data.get("start_line", 1) - 1)
+    end = input_data.get("end_line")
+
+    with open(filepath, encoding="utf-8", errors="replace") as f:
+        max_lines = 200
+        if end is not None:
+            max_lines = min(end - start, max_lines)
+        selected = list(itertools.islice(f, start, start + max_lines))
+
+    selected = [line.rstrip("\n") for line in selected]
+
+    total_lines_hint = start + len(selected)
+    if len(selected) >= 200:
+        selected.append(f"... [truncated at 200 lines — file continues beyond line {total_lines_hint}]")
+
+    numbered = [f"{i + start + 1:4d} | {line}" for i, line in enumerate(selected)]
+    return "\n".join(numbered)
+
+
+def tool_search_code(input_data: dict) -> str:
+    pattern = input_data["pattern"]
+
+    search_dir = _validate_path(input_data.get("directory", ""))
+    if search_dir is None:
+        search_dir = REPO_ROOT
+
+    file_pattern = input_data.get("file_pattern", "")
+
+    if file_pattern and not re.match(r"^[a-zA-Z0-9_.*?/-]+$", file_pattern):
+        return "Invalid file pattern: only alphanumeric, _, ., *, ?, /, - allowed."
+
+    if re.escape(pattern) != pattern:
+        grep_flag = "-rnE"
+    else:
+        grep_flag = "-rnF"
+
+    cmd = ["grep", grep_flag, pattern, str(search_dir)]
+    if file_pattern:
+        cmd.insert(2, f"--include={file_pattern}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        output = result.stdout.strip()
+        if not output:
+            return "No matches found."
+
+        lines = output.split("\n")
+        if len(lines) > 30:
+            total_count = len(lines)
+            lines = lines[:30]
+            lines.append(f"... [{total_count} total matches, showing first 30]")
+
+        return "\n".join(
+            line.replace(str(REPO_ROOT.resolve()) + "/", "").replace(str(REPO_ROOT) + "/", "")
+            for line in lines
+        )
+    except subprocess.TimeoutExpired:
+        return "Search timed out."
+    except subprocess.SubprocessError as e:
+        return f"Search failed: {type(e).__name__}"
+
+
+def tool_read_rule(input_data: dict, config: dict) -> str:
+    rule_id = input_data["rule_id"]
+    if "/" in rule_id or "\\" in rule_id or ".." in rule_id:
+        return "Access denied: invalid rule ID"
+
+    rules_dir = config.get("rules", {}).get("directory", ".cursor/rules")
+    file_pattern = config.get("rules", {}).get("file_pattern", "*.mdc")
+    extension = file_pattern.replace("*", "")  # e.g., "*.mdc" -> ".mdc"
+
+    rule_path = REPO_ROOT / rules_dir / f"{rule_id}{extension}"
+    if not rule_path.exists():
+        # Try without assumed extension (maybe the ID already includes it)
+        rule_path = REPO_ROOT / rules_dir / rule_id
+        if not rule_path.exists():
+            return f"Rule not found: {rule_id}"
+
+    content = rule_path.read_text(encoding="utf-8")
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            content = parts[2].strip()
+
+    if len(content) > 3000:
+        content = content[:3000] + "\n... [truncated]"
+    return content
+
+
+def tool_list_directory(input_data: dict) -> str:
+    dirpath = _validate_path(input_data["path"])
+    if dirpath is None:
+        return "Access denied: path is outside the repository"
+    if not dirpath.exists():
+        return f"Directory not found: {input_data['path']}"
+    if not dirpath.is_dir():
+        return f"Not a directory: {input_data['path']}"
+
+    entries = sorted(dirpath.iterdir())
+    lines = []
+    for entry in entries[:50]:
+        prefix = "d " if entry.is_dir() else "  "
+        lines.append(f"{prefix}{entry.name}")
+
+    if len(entries) > 50:
+        lines.append(f"... [{len(entries)} total entries, showing first 50]")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# System prompt — built from project config
+# ---------------------------------------------------------------------------
+
+def build_system_prompt(context: dict, config: dict) -> str:
+    """Build the system prompt from project config + rule summaries."""
+
+    project = context.get("project", {})
+    project_name = project.get("name", "")
+    project_desc = project.get("description", "")
+    tech_stack = project.get("tech_stack", "")
+
+    # Build project identity line
+    if project_name and project_desc:
+        identity = f"a PR for the {project_name} project — {project_desc}"
+    elif project_name:
+        identity = f"a PR for the {project_name} project"
+    else:
+        identity = "a PR"
+
+    if tech_stack:
+        identity += f" (tech stack: {tech_stack})"
+
+    # Build rule summary
+    rule_summaries = []
+    for rule in context.get("rules", []):
+        desc = rule.get("description", "")
+        rule_summaries.append(f"- **{rule['name']}**: {desc}")
+    rule_list = "\n".join(rule_summaries) if rule_summaries else "No project-specific rules configured."
+
+    # Build spec reference
+    spec_refs = []
+    for doc in context.get("spec_docs", []):
+        spec_refs.append(f"- {doc['path']}")
+    spec_list = "\n".join(spec_refs) if spec_refs else "No spec/plan linked in the PR description."
+
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    return f"""You are a senior software engineer reviewing {identity}.
+
+Today's date is {today}. Use this when evaluating dates in code or documentation — do NOT flag dates as "future" if they are on or before today.
+
+You review like a tech lead who cares deeply about code quality. You're helpful, specific, and have a good sense of humor. You are NOT a cop — you're the senior colleague everyone wants reviewing their code because you make it better.
+
+## Review Dimensions (in priority order)
+
+### 1. Correctness — Does it actually work?
+- Logic errors: off-by-one, inverted conditions, wrong comparisons
+- Missing null/None checks on values that could be absent
+- Async issues: missing `await`, unhandled promises, race conditions
+- Edge cases the tests might miss: empty lists, None, zero-length strings, Unicode
+
+### 2. Security — Can this be exploited?
+- Auth: new endpoints missing authentication or checking wrong user
+- Data exposure: API responses leaking internal fields (passwords, tokens, internal IDs)
+- Injection: raw string interpolation in SQL or shell commands
+- SSRF: HTTP calls to user-supplied URLs without validation
+
+### 3. Performance — Will this be slow?
+- N+1 queries: DB call inside a loop instead of batch fetch
+- Unbounded data: fetching all records without limit/pagination
+- Expensive operations in hot paths: LLM calls inside loops, heavy computation per request
+- Missing indexes for new query patterns
+
+### 4. Backward Compatibility — Will this break existing consumers?
+- API changes: renamed/removed fields that break clients
+- State schema changes: new fields that old data doesn't have
+- Import changes: moved modules that other files import
+- DB changes without migration
+
+### 5. Completeness — What's missing?
+- Error handling: happy path works, but what if the external API is down?
+- Logging: critical operations with no log entry for debugging
+- Tests: new behavior with no test, or existing tests not updated
+- Docs: API changes not reflected in documentation
+
+### 6. Design & Patterns — Is this the right approach?
+- Check what patterns exist nearby: if neighboring modules use a dispatch map, a new if/elif chain should too
+- Search for duplicate logic: does a similar function already exist elsewhere?
+- Coupling: does this new code import from too many unrelated modules?
+- Naming: do variable/function names communicate intent clearly?
+- Then check against project rules (see rule list below)
+
+### 7. Architecture — Does this change fit the system?
+- Is this code in the right module/layer?
+- Does this new code have a single, clear responsibility?
+- Search for similar logic elsewhere. If 3+ places do the same thing, suggest extraction.
+- Count imports in new files. If a file imports from 5+ different modules across layers, it may be doing too much.
+
+## How to Investigate
+
+1. READ the PR diff carefully — understand what changed and why.
+2. USE TOOLS strategically (aim for 3-6 targeted tool calls):
+   - `read_file` — check related files (callers, tests, models, the full file around a change)
+   - `search_code` — find callers of changed functions, check for duplicates, verify patterns
+   - `read_rule` — read the full rule before citing it in a suggestion
+   - `list_directory` — check if tests exist, see module structure
+3. Before suggesting a pattern change, SEARCH for how the codebase already handles it. Follow existing patterns.
+4. ONLY suggest issues you've verified with context. Never guess or assume.
+5. When you have enough context, produce your final review.
+
+## Your Tone and Personality
+- You're the senior colleague everyone WANTS reviewing their code — because you make it fun AND better.
+- Coach, not cop. Suggestions, not demands.
+- Explain the WHY with personality.
+- Use humor naturally. Programming puns, movie references, gentle roasts — whatever fits the moment.
+- Celebrate good code! Positive feedback matters.
+- If the code is solid: "Ship it!" with genuine enthusiasm.
+- Vary your tone — don't be the same joke every time.
+
+## Limits
+- **"critical" and "warning" have NO limit** — always report bugs, security issues, data loss risks, and breaking changes.
+- **"suggestion" and "praise" are capped at 10 total** — pick the highest-impact improvements.
+- If no critical/warning issues and fewer than 2 suggestions, just say "Looks good."
+- Don't nitpick formatting or style — linters handle that.
+- Don't flag things that existing CI already catches.
+
+## Project Rules (summaries — use read_rule tool for full content)
+{rule_list}
+
+## Linked Spec/Plan Documents (use read_file to read relevant sections)
+{spec_list}
+
+## Output Format
+Return ONLY a JSON object (no text before or after, no markdown fences):
+{{
+  "summary": "One sentence overall assessment",
+  "suggestions": [
+    {{
+      "file": "path/to/file.py",
+      "line": 42,
+      "severity": "warning",
+      "rule": "B-28",
+      "title": "Short title",
+      "body": "Detailed explanation with context and a concrete fix suggestion."
+    }}
+  ]
+}}
+
+## Severity Classification Rules
+
+### CRITICAL — Must fix before merge. This will BLOCK the PR.
+
+A finding is CRITICAL only if it meets ONE of these criteria:
+
+**Security:** Hardcoded secrets, SQL/command injection, missing auth, PII leaked in logs.
+**Data Integrity:** DB write that could corrupt data, missing null check that will crash, cascade delete of user data.
+**Code Bugs:** Off-by-one, wrong comparison, inverted boolean, wrong variable, missing await, dead code hiding a bug.
+**Logic:** Exception swallowed silently, infinite loop, business logic changed without test update.
+**Contract:** API schema changed without backward compat, state field renamed without migration, import path changed without updating callers.
+
+**CALIBRATION:** IF IN DOUBT → WARNING, not critical. Critical means "this WILL cause a bug, security breach, or data loss in production." Aim for 0-1 critical per PR.
+
+### WARNING — Should fix, doesn't block merge.
+Missing type hints, suboptimal patterns, missing error context, performance concerns, missing docstrings, potential edge cases.
+
+### SUGGESTION — Nice to have. Must have a CONCRETE ACTION.
+Naming improvements, code organization ideas, documentation gaps, minor style preferences.
+
+### PRAISE — Positive reinforcement.
+Clean patterns, good test coverage, thoughtful error handling, readable code.
+
+Allowed severity values: "critical", "warning", "suggestion", "praise"
+
+If code is solid: {{"summary": "Clean PR, ship it!", "suggestions": []}}"""
+
+
+def build_user_message(context: dict) -> str:
+    """Build the initial user message with just the diff."""
+    parts = []
+
+    parts.append("## Changed Files")
+    for f in context["changed_files"]:
+        parts.append(f"- {f}")
+    parts.append("")
+
+    parts.append("## PR Info")
+    parts.append(f"- Title: {context.get('pr_title', 'N/A')}")
+    parts.append(f"- Branch: {context.get('branch_name', 'N/A')}")
+    parts.append("")
+
+    parts.append("## PR Diff")
+    parts.append("```diff")
+    parts.append(context["diff"])
+    parts.append("```")
+
+    parts.append("")
+    parts.append(
+        "Review this diff. Use tools to investigate anything that needs context, "
+        "but be efficient — aim for 3-5 targeted tool calls, not exhaustive exploration. "
+        "When you have enough context, return your final JSON review. "
+        "Do NOT use all tool rounds just because you can."
+    )
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
+
+def dry_run(context: dict, config: dict):
+    """Log what the agent would do without making API calls."""
+    print("=== DRY RUN MODE (no ANTHROPIC_API_KEY set or dry-run enabled) ===")
+    print(f"Model: {MODEL}")
+    print(f"Mode: AGENTIC (tool use)")
+    print(f"Changed files: {len(context['changed_files'])}")
+    print(f"Rules available: {[r['name'] for r in context['rules']]}")
+    print(f"Spec docs: {[d['path'] for d in context.get('spec_docs', [])]}")
+    print(f"Tools: read_file, search_code, read_rule, list_directory")
+    print(f"Max tool rounds: {MAX_TOOL_ROUNDS}")
+
+    system = build_system_prompt(context, config)
+    user = build_user_message(context)
+    system_tokens = len(system) // 4
+    user_tokens = len(user) // 4
+    print(f"Initial prompt — system: ~{system_tokens} tokens, user: ~{user_tokens} tokens")
+
+    mock_result = {
+        "summary": "[DRY RUN] Review agent would investigate this PR using tools. Set ANTHROPIC_API_KEY to enable.",
+        "suggestions": [],
+        "dry_run": True,
+        "stats": {
+            "mode": "agentic",
+            "rules_count": len(context["rules"]),
+            "rules": [r["name"] for r in context["rules"]],
+            "spec_docs": [d["path"] for d in context.get("spec_docs", [])],
+            "tools_available": ["read_file", "search_code", "read_rule", "list_directory"],
+            "estimated_initial_tokens": system_tokens + user_tokens,
+        },
+    }
+    OUTPUT_PATH.write_text(json.dumps(mock_result, indent=2))
+    print("=== DRY RUN COMPLETE ===")
+
+
+def live_review(context: dict, config: dict):
+    """Run the agentic review loop with Claude tool use."""
+    try:
+        import anthropic
+    except ImportError:
+        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+        sys.exit(1)
+
+    client = anthropic.Anthropic()
+    system_prompt = build_system_prompt(context, config)
+    user_message = build_user_message(context)
+
+    messages = [{"role": "user", "content": user_message}]
+
+    print(f"=== Agentic Review ({MODEL}) ===")
+    total_input_tokens = 0
+    total_output_tokens = 0
+    tool_calls = 0
+    start = time.monotonic()
+
+    for round_num in range(MAX_TOOL_ROUNDS):
+        print(f"  Round {round_num + 1}...")
+
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=[
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=TOOLS,
+                messages=messages,
+            )
+        except Exception as e:
+            print(f"ERROR: API call failed: {e}")
+            OUTPUT_PATH.write_text(
+                json.dumps(
+                    {
+                        "summary": "Review agent encountered an API error.",
+                        "suggestions": [],
+                        "error": str(e),
+                    }
+                )
+            )
+            return
+
+        total_input_tokens += response.usage.input_tokens
+        total_output_tokens += response.usage.output_tokens
+
+        if response.stop_reason == "end_turn":
+            print(f"  Agent done after {round_num + 1} rounds, {tool_calls} tool calls.")
+            break
+
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if hasattr(block, "text") and block.text.strip():
+                    print(f"    Thinking: {block.text.strip()[:200]}")
+                if block.type == "tool_use":
+                    tool_calls += 1
+                    print(f"    Tool: {block.name}({json.dumps(block.input)[:150]})")
+                    result = execute_tool(block.name, block.input, config)
+                    result_preview = result[:100].replace("\n", " ")
+                    print(f"    Result: {result_preview}...")
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result[:5000],
+                        }
+                    )
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        print(f"  Unexpected stop_reason: {response.stop_reason}")
+        break
+
+    elapsed_ms = (time.monotonic() - start) * 1000
+    print(f"Completed in {elapsed_ms:.0f}ms")
+    print(f"Tokens — input: {total_input_tokens}, output: {total_output_tokens}")
+    print(f"Tool calls: {tool_calls}")
+
+    input_cost = total_input_tokens * 0.000003
+    output_cost = total_output_tokens * 0.000015
+    print(f"Estimated cost: ${input_cost + output_cost:.4f}")
+
+    # Extract the final JSON from the last response
+    raw_text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            raw_text += block.text
+
+    raw_text = raw_text.strip()
+
+    try:
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        json_start = raw_text.find("{")
+        json_end = raw_text.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            json_str = raw_text[json_start:json_end]
+            result = json.loads(json_str)
+        else:
+            result = json.loads(raw_text)
+    except json.JSONDecodeError:
+        print("WARNING: Could not parse final response as JSON. Posting as raw text.")
+        result = {
+            "summary": "Review completed (response format issue — showing raw output).",
+            "suggestions": [],
+            "raw_response": raw_text[:3000],
+        }
+
+    result["stats"] = {
+        "mode": "agentic",
+        "model": MODEL,
+        "rounds": round_num + 1,
+        "tool_calls": tool_calls,
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "duration_ms": round(elapsed_ms),
+        "cost_estimate": round(input_cost + output_cost, 4),
+    }
+
+    OUTPUT_PATH.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    print(f"Summary: {result.get('summary', 'N/A')}")
+    print(f"Suggestions: {len(result.get('suggestions', []))}")
+    print("=== Agentic Review Complete ===")
+
+
+def main():
+    if not CONTEXT_PATH.exists():
+        print("ERROR: No context file found. Run prepare-context.py first.")
+        sys.exit(1)
+
+    context = json.loads(CONTEXT_PATH.read_text())
+    config = load_config()
+
+    # Apply config overrides
+    global MODEL, MAX_TOKENS, MAX_TOOL_ROUNDS
+    review_config = config.get("review", {})
+    MODEL = os.environ.get("REVIEW_AGENT_MODEL", review_config.get("model", MODEL))
+    MAX_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_TOKENS", review_config.get("max_tokens", MAX_TOKENS)))
+    MAX_TOOL_ROUNDS = review_config.get("max_tool_rounds", MAX_TOOL_ROUNDS)
+
+    if context.get("skip"):
+        print(f"Skipping: {context.get('reason', 'unknown')}")
+        OUTPUT_PATH.write_text(json.dumps({"summary": "Skipped", "suggestions": [], "skip": True}))
+        return
+
+    is_dry_run = os.environ.get("REVIEW_AGENT_DRY_RUN", "false").lower() == "true"
+    if is_dry_run or not os.environ.get("ANTHROPIC_API_KEY", ""):
+        dry_run(context, config)
+    else:
+        live_review(context, config)
+
+
+if __name__ == "__main__":
+    main()

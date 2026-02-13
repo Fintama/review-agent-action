@@ -1,0 +1,131 @@
+name: "AI Code Review Agent"
+description: "Agentic PR reviewer using Claude — reads your project rules, specs, and codebase to post inline review comments."
+author: "Fintama"
+
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  anthropic-api-key:
+    description: "Anthropic API key for Claude"
+    required: true
+  app-id:
+    description: "GitHub App ID for posting reviews (comments appear as the app identity)"
+    required: false
+    default: ""
+  app-private-key:
+    description: "GitHub App private key (PEM format)"
+    required: false
+    default: ""
+  github-token:
+    description: "GitHub token (fallback if no GitHub App configured). Uses github.token by default."
+    required: false
+    default: ${{ github.token }}
+  config-path:
+    description: "Path to the project config file (relative to repo root)"
+    required: false
+    default: ".github/review-agent/config.yaml"
+  model:
+    description: "Claude model to use"
+    required: false
+    default: "claude-sonnet-4-20250514"
+  max-tokens:
+    description: "Max tokens for LLM response"
+    required: false
+    default: "8192"
+  auto-approve:
+    description: "Enable auto-approval for safe PRs (true/false)"
+    required: false
+    default: "true"
+  dry-run:
+    description: "Run without posting (for testing)"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    # Generate GitHub App token if app credentials are provided
+    - name: Generate App Token
+      id: app-token
+      if: inputs.app-id != '' && inputs.app-private-key != ''
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+
+    # Determine which token to use (App token preferred, fallback to github-token)
+    - name: Set review token
+      id: token
+      shell: bash
+      run: |
+        if [ -n "${{ steps.app-token.outputs.token }}" ]; then
+          echo "value=${{ steps.app-token.outputs.token }}" >> "$GITHUB_OUTPUT"
+          echo "Using GitHub App token"
+        else
+          echo "value=${{ inputs.github-token }}" >> "$GITHUB_OUTPUT"
+          echo "Using provided GitHub token"
+        fi
+
+    - name: Get PR diff and changed files
+      shell: bash
+      run: |
+        git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+        git diff --name-only origin/${{ github.base_ref }}...HEAD > /tmp/changed-files.txt
+        echo "Changed files:"
+        cat /tmp/changed-files.txt
+        echo "Diff size: $(wc -l < /tmp/pr.diff) lines"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Prepare review context
+      shell: bash
+      env:
+        PR_BODY: ${{ github.event.pull_request.body }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        BRANCH_NAME: ${{ github.head_ref }}
+        REVIEW_AGENT_CONFIG: ${{ inputs.config-path }}
+        REVIEW_AGENT_ACTION_PATH: ${{ github.action_path }}
+      run: python ${{ github.action_path }}/scripts/prepare-context.py
+
+    - name: Run LLM review
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        REVIEW_AGENT_MODEL: ${{ inputs.model }}
+        REVIEW_AGENT_MAX_TOKENS: ${{ inputs.max-tokens }}
+        REVIEW_AGENT_CONFIG: ${{ inputs.config-path }}
+        REVIEW_AGENT_ACTION_PATH: ${{ github.action_path }}
+        REVIEW_AGENT_DRY_RUN: ${{ inputs.dry-run }}
+      run: python ${{ github.action_path }}/scripts/llm-review.py
+
+    - name: Post review
+      id: post-review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.token.outputs.value }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REVIEW_AGENT_AUTO_APPROVE: ${{ inputs.auto-approve }}
+        REVIEW_AGENT_CONFIG: ${{ inputs.config-path }}
+        REVIEW_AGENT_ACTION_PATH: ${{ github.action_path }}
+        REVIEW_AGENT_DRY_RUN: ${{ inputs.dry-run }}
+      continue-on-error: true
+      run: python ${{ github.action_path }}/scripts/post-review.py
+
+    - name: Notify on failure
+      if: steps.post-review.outcome == 'failure'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.token.outputs.value }}
+      run: |
+        gh pr comment ${{ github.event.pull_request.number }} \
+          --body "⚠️ **Review agent failed** — the automated review could not complete. A human reviewer should review this PR. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."

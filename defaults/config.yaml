@@ -1,0 +1,96 @@
+# ──────────────────────────────────────────────────────────────
+# Default configuration for the AI Code Review Agent
+#
+# These defaults are used when a consuming repo does not provide
+# its own .github/review-agent/config.yaml.
+#
+# All paths are relative to the consuming repo's root.
+# ──────────────────────────────────────────────────────────────
+
+# ── Project identity (used in the LLM system prompt) ──
+project:
+  name: ""                  # e.g., "Swisper", "Client Portal"
+  description: ""           # e.g., "AI personal assistant built with FastAPI and React"
+  tech_stack: ""            # e.g., "FastAPI, LangGraph, React, TypeScript"
+
+# ── Rules (optional — e.g., .cursor/rules/*.mdc files) ──
+rules:
+  enabled: true
+  directory: ".cursor/rules"          # Directory containing rule files
+  file_pattern: "*.mdc"               # Glob for rule files
+  # Always include these rules (even if no files match their globs)
+  always_include: []                   # e.g., ["00-workflow", "03-pull-requests"]
+
+# ── Spec/plan discovery ──
+docs:
+  enabled: true
+  spec_dirs:                           # Directories to search for specs/plans
+    - "docs/specs"
+    - "docs/plans"
+  # Directory-to-doc map (fallback when no spec is linked in the PR)
+  directory_doc_map: {}                # e.g., {"src/auth/": ["docs/auth-design.md"]}
+
+# ── Blast radius tracing ──
+blast_radius:
+  enabled: true
+  language: "auto"                     # "python", "typescript", "auto" (detect from file extensions)
+  source_dirs: []                      # Directories to search for importers (empty = whole repo)
+  module_prefix_strip: ""              # Prefix to strip from file paths to get module paths
+                                       # e.g., "apps/backend/" → "apps/backend/swisper/foo.py" becomes "swisper.foo"
+  max_files: 10
+
+# ── Risk assessment (for auto-approve decisions) ──
+risk:
+  structural_paths:                    # Files here → needs human review
+    - "migrations/"
+    - "alembic/"
+  security_paths:                      # Files here → needs human review
+    - "auth/"
+    - "security/"
+    - "middleware/"
+  security_dep_files:                  # Dependency files → supply chain risk
+    - "requirements.txt"
+    - "pyproject.toml"
+    - "package.json"
+    - "package-lock.json"
+    - "pnpm-lock.yaml"
+    - "yarn.lock"
+    - "Gemfile.lock"
+    - "go.sum"
+  infrastructure_patterns:             # Infra files → needs human review
+    - "docker-compose"
+    - "Dockerfile"
+    - ".github/workflows/"
+    - "terraform/"
+    - "k8s/"
+  domain_paths: {}                     # For cross-cutting detection
+                                       # e.g., {"src/api/": "api", "src/services/": "services"}
+  thresholds:
+    max_code_files: 15                 # More than this → too complex for auto-approve
+    max_code_lines: 1000               # More than this → too complex for auto-approve
+    cross_cutting_domains: 3           # Touching 3+ domains → needs human review
+
+# ── Review behavior ──
+review:
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 8192
+  max_tool_rounds: 10
+  auto_approve_enabled: true
+  max_diff_lines: 1500
+  max_blast_radius_files: 10
+  max_rule_files: 25
+
+# ── Branding (for the posted review comments) ──
+branding:
+  review_header: "## Code Review"      # Header for the summary comment
+  comment_tag: "<!-- ai-review-agent -->"
+  summary_tag: "<!-- ai-review-agent-summary -->"
+
+# ── File classification ──
+files:
+  doc_extensions:
+    - ".md"
+    - ".mdc"
+    - ".txt"
+    - ".rst"
+    - ".adoc"

@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────────
+# Migration example: Swisper (helvetiq) workflow
+#
+# This replaces the existing .github/workflows/review-agent.yml
+# in the helvetiq repo. The old local scripts under
+# .github/scripts/review-agent/ can be deleted after migration.
+# ──────────────────────────────────────────────────────────────
+
+name: Swisper Rule Review Agent
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: "\U0001f4dd Rule Review"
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: AI Review
+        uses: fintama/review-agent-action@v1
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          auto-approve: ${{ vars.REVIEW_AGENT_AUTO_APPROVE || 'true' }}
