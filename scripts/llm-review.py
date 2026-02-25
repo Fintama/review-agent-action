@@ -36,6 +36,10 @@ VERIFICATION_RULES_PATH = SCRIPT_DIR.parent / "defaults" / "verification-rules.m
 MODEL = os.environ.get("REVIEW_AGENT_MODEL", "claude-sonnet-4-20250514")
 MAX_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_TOKENS", "8192"))
 MAX_TOOL_ROUNDS = 10
+MAX_TOOL_ROUNDS_CEILING = 30
+DOC_EXTENSIONS = {".md", ".mdc", ".txt", ".rst", ".mdx"}
+SKIP_EXTENSIONS = {".lock", ".yaml", ".yml", ".json", ".toml"}
+LOCKFILE_NAMES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "poetry.lock", "Pipfile.lock"}
 
 
 # ---------------------------------------------------------------------------
@@ -366,14 +370,15 @@ You review like a tech lead who cares deeply about code quality. You're helpful,
 ## How to Investigate
 
 1. READ the PR diff carefully — understand what changed and why.
-2. USE TOOLS strategically (aim for 3-6 targeted tool calls):
+2. Review ALL changed files. Do not submit your final JSON until you have examined every changed file's diff. Use as many tool calls as you need.
+3. USE TOOLS to get context:
    - `read_file` — check related files (callers, tests, models, the full file around a change)
    - `search_code` — find callers of changed functions, check for duplicates, verify patterns
    - `read_rule` — read the full rule before citing it in a suggestion
    - `list_directory` — check if tests exist, see module structure
-3. Before suggesting a pattern change, SEARCH for how the codebase already handles it. Follow existing patterns.
-4. ONLY suggest issues you've verified with context. Never guess or assume.
-5. When you have enough context, produce your final review.
+4. Before suggesting a pattern change, SEARCH for how the codebase already handles it. Follow existing patterns.
+5. ONLY suggest issues you've verified with context. Never guess or assume.
+6. When you have examined every changed file and have enough context, produce your final review.
 
 ## Your Tone and Personality
 - You're the senior colleague everyone WANTS reviewing their code — because you make it fun AND better.
@@ -462,10 +467,9 @@ def build_user_message(context: dict) -> str:
 
     parts.append("")
     parts.append(
-        "Review this diff. Use tools to investigate anything that needs context, "
-        "but be efficient — aim for 3-5 targeted tool calls, not exhaustive exploration. "
-        "When you have enough context, return your final JSON review. "
-        "Do NOT use all tool rounds just because you can."
+        "Review this diff. Examine every changed file — do not skip any. "
+        "Use tools to investigate anything that needs context. "
+        "When you have reviewed all files, return your final JSON review."
     )
 
     return "\n".join(parts)
@@ -507,6 +511,55 @@ def dry_run(context: dict, config: dict):
     }
     OUTPUT_PATH.write_text(json.dumps(mock_result, indent=2))
     print("=== DRY RUN COMPLETE ===")
+
+
+def compute_max_tool_rounds(num_changed_files: int) -> int:
+    """Scale tool rounds with PR size. More files = more investigation needed."""
+    base = 10
+    per_file = 1.5
+    dynamic = base + int(num_changed_files * per_file)
+    return min(max(dynamic, base), MAX_TOOL_ROUNDS_CEILING)
+
+
+def check_file_coverage(
+    changed_files: list[str],
+    files_read: set[str],
+    result: dict,
+) -> list[str]:
+    """Return changed files that the agent hasn't reviewed.
+
+    A file counts as reviewed if:
+    - The agent used read_file on it
+    - The agent mentioned it in a suggestion
+    - It's a doc/lockfile that doesn't need code review
+    """
+    files_in_suggestions = {s.get("file", "") for s in result.get("suggestions", [])}
+    reviewed = files_read | files_in_suggestions
+
+    missed = []
+    for f in changed_files:
+        if f in reviewed:
+            continue
+        basename = Path(f).name
+        if basename in LOCKFILE_NAMES:
+            continue
+        ext = Path(f).suffix
+        if ext in DOC_EXTENSIONS:
+            continue
+        missed.append(f)
+    return missed
+
+
+def build_coverage_followup(missed_files: list[str]) -> str:
+    """Build a follow-up message asking the agent to review missed files."""
+    file_list = "\n".join(f"- {f}" for f in missed_files)
+    return (
+        f"You haven't reviewed these changed files yet:\n{file_list}\n\n"
+        "Please review them now. Read each file's changes in the diff above "
+        "(or use read_file if you need more context), then return an UPDATED "
+        "JSON review that includes findings for ALL files — both the ones you "
+        "already reviewed and these new ones."
+    )
 
 
 def _extract_json(raw_text: str) -> dict | None:
@@ -641,15 +694,20 @@ def live_review(context: dict, config: dict):
     user_message = build_user_message(context)
 
     messages = [{"role": "user", "content": user_message}]
+    changed_files = context.get("changed_files", [])
+    max_rounds = compute_max_tool_rounds(len(changed_files))
+    files_read: set[str] = set()
+    coverage_followup_sent = False
 
     print(f"=== Agentic Review ({MODEL}) ===")
+    print(f"  Changed files: {len(changed_files)}, max rounds: {max_rounds}")
     total_input_tokens = 0
     total_output_tokens = 0
     tool_calls = 0
     start = time.monotonic()
 
-    for round_num in range(MAX_TOOL_ROUNDS):
-        print(f"  Round {round_num + 1}...")
+    for round_num in range(max_rounds):
+        print(f"  Round {round_num + 1}/{max_rounds}...")
 
         try:
             response = client.messages.create(
@@ -682,6 +740,23 @@ def live_review(context: dict, config: dict):
         total_output_tokens += response.usage.output_tokens
 
         if response.stop_reason == "end_turn":
+            # Check file coverage before accepting the result
+            raw_text = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    raw_text += block.text
+            preliminary = _extract_json(raw_text)
+
+            if preliminary and not coverage_followup_sent:
+                missed = check_file_coverage(changed_files, files_read, preliminary)
+                if missed:
+                    print(f"  Coverage gap: {len(missed)} files unreviewed — sending follow-up")
+                    coverage_followup_sent = True
+                    followup = build_coverage_followup(missed)
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": followup})
+                    continue
+
             print(f"  Agent done after {round_num + 1} rounds, {tool_calls} tool calls.")
             break
 
@@ -693,6 +768,8 @@ def live_review(context: dict, config: dict):
                 if block.type == "tool_use":
                     tool_calls += 1
                     print(f"    Tool: {block.name}({json.dumps(block.input)[:150]})")
+                    if block.name == "read_file" and "path" in block.input:
+                        files_read.add(block.input["path"])
                     result = execute_tool(block.name, block.input, config)
                     result_preview = result[:100].replace("\n", " ")
                     print(f"    Result: {result_preview}...")
