@@ -660,29 +660,43 @@ that fails verification.
 {json.dumps(result, indent=2)}
 ```"""
 
-    print("  Running verification pass...")
+    max_verify_rounds = 6
+    print(f"  Running verification pass (max {max_verify_rounds} rounds, last = structured JSON)...")
     start = time.monotonic()
     try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=[
-                {
-                    "type": "text",
-                    "text": verification_rules,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=TOOLS,
-            messages=[{"role": "user", "content": user_content}],
-        )
-
-        messages = [
-            {"role": "user", "content": user_content},
-        ]
+        messages = [{"role": "user", "content": user_content}]
         verification_tool_calls = 0
+        system_block = [
+            {"type": "text", "text": verification_rules, "cache_control": {"type": "ephemeral"}}
+        ]
 
-        for verify_round in range(5):
+        for verify_round in range(max_verify_rounds):
+            is_final = (verify_round == max_verify_rounds - 1)
+
+            if is_final:
+                messages.append({
+                    "role": "user",
+                    "content": "Return your verified JSON review now.",
+                })
+
+            api_kwargs: dict = {
+                "model": MODEL,
+                "max_tokens": MAX_TOKENS,
+                "system": system_block,
+                "messages": messages,
+            }
+            if is_final:
+                api_kwargs["output_config"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": REVIEW_JSON_SCHEMA,
+                    }
+                }
+            else:
+                api_kwargs["tools"] = TOOLS
+
+            response = client.messages.create(**api_kwargs)
+
             if response.stop_reason == "end_turn":
                 break
 
@@ -700,13 +714,6 @@ that fails verification.
                         })
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
-                response = client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=[{"type": "text", "text": verification_rules, "cache_control": {"type": "ephemeral"}}],
-                    tools=TOOLS,
-                    messages=messages,
-                )
                 continue
             break
 
