@@ -29,6 +29,8 @@ from config_loader import load_config, get_repo_root
 CONTEXT_PATH = Path("/tmp/review-context.json")
 OUTPUT_PATH = Path("/tmp/review-result.json")
 REPO_ROOT = get_repo_root()
+SCRIPT_DIR = Path(__file__).resolve().parent
+VERIFICATION_RULES_PATH = SCRIPT_DIR.parent / "defaults" / "verification-rules.md"
 
 # Defaults — overridable via config
 MODEL = os.environ.get("REVIEW_AGENT_MODEL", "claude-sonnet-4-20250514")
@@ -507,6 +509,125 @@ def dry_run(context: dict, config: dict):
     print("=== DRY RUN COMPLETE ===")
 
 
+def _extract_json(raw_text: str) -> dict | None:
+    """Extract a JSON object from model output, handling markdown fences."""
+    raw_text = raw_text.strip()
+    try:
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        json_start = raw_text.find("{")
+        json_end = raw_text.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            return json.loads(raw_text[json_start:json_end])
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return None
+
+
+def run_verification_pass(client, result: dict, context: dict) -> dict:
+    """Second pass: verify findings against verification rules to filter false positives."""
+    suggestions = result.get("suggestions", [])
+    if not suggestions:
+        return result
+
+    if not VERIFICATION_RULES_PATH.exists():
+        print("  Verification rules not found, skipping verification pass.")
+        return result
+
+    verification_rules = VERIFICATION_RULES_PATH.read_text(encoding="utf-8")
+
+    diff_excerpt = context.get("diff", "")[:8000]
+
+    user_content = f"""## Verification Task
+
+Below are the review findings and the diff they were generated from.
+Apply the verification rules to each finding. Drop or fix any finding
+that fails verification.
+
+## Diff (for reference)
+```diff
+{diff_excerpt}
+```
+
+## Findings to Verify
+```json
+{json.dumps(result, indent=2)}
+```"""
+
+    print("  Running verification pass...")
+    start = time.monotonic()
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=[
+                {
+                    "type": "text",
+                    "text": verification_rules,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=TOOLS,
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+        messages = [
+            {"role": "user", "content": user_content},
+        ]
+        verification_tool_calls = 0
+
+        for verify_round in range(5):
+            if response.stop_reason == "end_turn":
+                break
+
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        verification_tool_calls += 1
+                        print(f"    Verify tool: {block.name}({json.dumps(block.input)[:120]})")
+                        tool_result = execute_tool(block.name, block.input, config={})
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": tool_result[:5000],
+                        })
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": tool_results})
+                response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=[{"type": "text", "text": verification_rules, "cache_control": {"type": "ephemeral"}}],
+                    tools=TOOLS,
+                    messages=messages,
+                )
+                continue
+            break
+
+        raw_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                raw_text += block.text
+
+        verified = _extract_json(raw_text)
+        elapsed = (time.monotonic() - start) * 1000
+
+        if verified and "suggestions" in verified:
+            before = len(suggestions)
+            after = len(verified.get("suggestions", []))
+            print(f"  Verification pass complete in {elapsed:.0f}ms "
+                  f"({verification_tool_calls} tool calls): "
+                  f"{before} → {after} findings")
+            return verified
+
+        print(f"  Verification pass could not parse response, keeping original findings.")
+        return result
+
+    except Exception as e:
+        print(f"  Verification pass failed ({e}), keeping original findings.")
+        return result
+
+
 def live_review(context: dict, config: dict):
     """Run the agentic review loop with Claude tool use."""
     try:
@@ -605,25 +726,32 @@ def live_review(context: dict, config: dict):
         if hasattr(block, "text"):
             raw_text += block.text
 
-    raw_text = raw_text.strip()
-
-    try:
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        json_start = raw_text.find("{")
-        json_end = raw_text.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            json_str = raw_text[json_start:json_end]
-            result = json.loads(json_str)
-        else:
-            result = json.loads(raw_text)
-    except json.JSONDecodeError:
+    result = _extract_json(raw_text)
+    if result is None:
         print("WARNING: Could not parse final response as JSON. Posting as raw text.")
         result = {
             "summary": "Review completed (response format issue — showing raw output).",
             "suggestions": [],
-            "raw_response": raw_text[:3000],
+            "raw_response": raw_text.strip()[:3000],
         }
+
+    # Verification pass: re-evaluate findings against verification rules
+    suggestions = result.get("suggestions", [])
+    has_critical_or_warning = any(
+        s.get("severity") in ("critical", "warning") for s in suggestions
+    )
+    if suggestions and has_critical_or_warning:
+        before_count = len(suggestions)
+        result = run_verification_pass(client, result, context)
+        after_count = len(result.get("suggestions", []))
+        if after_count < before_count:
+            result["verification"] = {
+                "findings_before": before_count,
+                "findings_after": after_count,
+                "dropped": before_count - after_count,
+            }
+    else:
+        print("  Skipping verification pass (no critical/warning findings).")
 
     result["stats"] = {
         "mode": "agentic",
