@@ -33,7 +33,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 VERIFICATION_RULES_PATH = SCRIPT_DIR.parent / "defaults" / "verification-rules.md"
 
 # Defaults — overridable via config
-MODEL = os.environ.get("REVIEW_AGENT_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("REVIEW_AGENT_MODEL", "claude-opus-4-6-20260220")
 MAX_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_TOKENS", "8192"))
 MAX_TOOL_ROUNDS = 10
 MAX_TOOL_ROUNDS_CEILING = 30
