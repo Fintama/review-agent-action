@@ -172,6 +172,37 @@ class TestBuildCoverageFollowup:
 # Prompt content — no efficiency bias
 # ---------------------------------------------------------------------------
 
+class TestReviewJsonSchema:
+    """The structured output schema must match what the prompt describes."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        import importlib
+        self.mod = importlib.import_module("llm-review")
+
+    def test_schema_has_required_top_level_fields(self):
+        schema = self.mod.REVIEW_JSON_SCHEMA
+        assert schema["required"] == ["summary", "suggestions"]
+
+    def test_suggestion_has_required_fields(self):
+        item_schema = self.mod.REVIEW_JSON_SCHEMA["properties"]["suggestions"]["items"]
+        assert "file" in item_schema["properties"]
+        assert "line" in item_schema["properties"]
+        assert "severity" in item_schema["properties"]
+        assert "title" in item_schema["properties"]
+        assert "body" in item_schema["properties"]
+
+    def test_severity_enum_matches_allowed_values(self):
+        severity = self.mod.REVIEW_JSON_SCHEMA["properties"]["suggestions"]["items"]["properties"]["severity"]
+        assert set(severity["enum"]) == {"critical", "warning", "suggestion", "praise"}
+
+    def test_no_additional_properties(self):
+        schema = self.mod.REVIEW_JSON_SCHEMA
+        assert schema["additionalProperties"] is False
+        item_schema = schema["properties"]["suggestions"]["items"]
+        assert item_schema["additionalProperties"] is False
+
+
 class TestPromptContent:
     @pytest.fixture(autouse=True)
     def _import(self):
