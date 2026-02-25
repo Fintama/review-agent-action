@@ -516,14 +516,12 @@ def dry_run(context: dict, config: dict):
 def compute_max_tool_rounds(num_changed_files: int) -> int:
     """Scale tool rounds with PR size. More files = more investigation needed.
 
-    Budget: base rounds + per-file rounds + reserve for final response and
-    potential coverage follow-up. The reserve ensures the agent always has
-    room to emit its JSON result even after investigating all files.
+    The last round is always reserved for the final response (tools are
+    withheld), so the effective tool budget is (result - 1).
     """
     base = 10
     per_file = 2
-    reserve = 3
-    dynamic = base + int(num_changed_files * per_file) + reserve
+    dynamic = base + int(num_changed_files * per_file)
     return min(max(dynamic, base), MAX_TOOL_ROUNDS_CEILING)
 
 
@@ -712,8 +710,13 @@ def live_review(context: dict, config: dict):
     tool_calls = 0
     start = time.monotonic()
 
+    is_final_round = False
     for round_num in range(max_rounds):
-        print(f"  Round {round_num + 1}/{max_rounds}...")
+        is_final_round = (round_num == max_rounds - 1)
+        round_label = f"  Round {round_num + 1}/{max_rounds}"
+        if is_final_round:
+            round_label += " (final — no tools)"
+        print(f"{round_label}...")
 
         try:
             response = client.messages.create(
@@ -726,7 +729,7 @@ def live_review(context: dict, config: dict):
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
-                tools=TOOLS,
+                tools=[] if is_final_round else TOOLS,
                 messages=messages,
             )
         except Exception as e:

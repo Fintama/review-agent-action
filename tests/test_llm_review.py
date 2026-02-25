@@ -84,10 +84,10 @@ class TestComputeMaxToolRounds:
         result = self.mod.compute_max_tool_rounds(0)
         assert result >= 10
 
-    def test_five_files_has_room_for_response(self):
-        """5-file PR should have enough rounds for investigation + final JSON."""
+    def test_five_files_gets_twenty_rounds(self):
+        """5-file PR: 10 base + 5*2 = 20 rounds (last one reserved for response)."""
         result = self.mod.compute_max_tool_rounds(5)
-        assert result >= 20, "5 files need ~15 tool rounds + reserve for response"
+        assert result == 20
 
 
 # ---------------------------------------------------------------------------
