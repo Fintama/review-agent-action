@@ -198,6 +198,62 @@ def get_diff_line_sets(diff_text: str) -> dict[str, set[int]]:
     return line_sets
 
 
+def get_changed_line_ranges(diff_text: str) -> dict[str, set[int]]:
+    """Parse a diff to find which new-side line numbers were added/modified per file.
+
+    Used for comment resolution: if a previous comment's file+line falls near
+    a changed line, the comment is considered addressed.
+    """
+    ranges: dict[str, set[int]] = {}
+    current_file: str | None = None
+    current_new_line = 0
+
+    for line in diff_text.split("\n"):
+        if line.startswith("diff --git"):
+            current_file = None
+        elif line.startswith("+++ b/"):
+            current_file = line[6:]
+            ranges.setdefault(current_file, set())
+        elif line.startswith("@@ "):
+            match = re.search(r"\+(\d+)", line)
+            if match:
+                current_new_line = int(match.group(1)) - 1
+        elif current_file is not None:
+            if line.startswith("+"):
+                current_new_line += 1
+                ranges.setdefault(current_file, set()).add(current_new_line)
+            elif line.startswith(" "):
+                current_new_line += 1
+            elif line.startswith("-"):
+                pass
+
+    return ranges
+
+
+COMMENT_PROXIMITY_THRESHOLD = 5
+
+
+def is_comment_addressed(
+    file_path: str,
+    line: int,
+    changed_ranges: dict[str, set[int]],
+) -> bool:
+    """Check if a previous comment was addressed by changes in the new push.
+
+    A comment is considered addressed if lines within COMMENT_PROXIMITY_THRESHOLD
+    of the comment's line were modified in the same file.
+    """
+    if not line or line <= 0:
+        return False
+    changed_lines = changed_ranges.get(file_path, set())
+    if not changed_lines:
+        return False
+    for offset in range(COMMENT_PROXIMITY_THRESHOLD + 1):
+        if (line + offset) in changed_lines or (line - offset) in changed_lines:
+            return True
+    return False
+
+
 def find_closest_commentable_line(
     commentable_lines: set[int], target_line: int,
 ) -> int | None:
