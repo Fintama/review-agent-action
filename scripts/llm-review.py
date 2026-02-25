@@ -514,10 +514,16 @@ def dry_run(context: dict, config: dict):
 
 
 def compute_max_tool_rounds(num_changed_files: int) -> int:
-    """Scale tool rounds with PR size. More files = more investigation needed."""
+    """Scale tool rounds with PR size. More files = more investigation needed.
+
+    Budget: base rounds + per-file rounds + reserve for final response and
+    potential coverage follow-up. The reserve ensures the agent always has
+    room to emit its JSON result even after investigating all files.
+    """
     base = 10
-    per_file = 1.5
-    dynamic = base + int(num_changed_files * per_file)
+    per_file = 2
+    reserve = 3
+    dynamic = base + int(num_changed_files * per_file) + reserve
     return min(max(dynamic, base), MAX_TOOL_ROUNDS_CEILING)
 
 
