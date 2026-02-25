@@ -734,6 +734,14 @@ def live_review(context: dict, config: dict):
         round_label = f"  Round {round_num + 1}/{max_rounds}"
         if is_final_round:
             round_label += " (final — no tools)"
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You have used all available tool rounds. "
+                    "Return your final JSON review now. "
+                    "Do not request any more tools — just output the JSON object."
+                ),
+            })
         print(f"{round_label}...")
 
         try:
