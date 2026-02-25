@@ -41,6 +41,37 @@ DOC_EXTENSIONS = {".md", ".mdc", ".txt", ".rst", ".mdx"}
 SKIP_EXTENSIONS = {".lock", ".yaml", ".yml", ".json", ".toml"}
 LOCKFILE_NAMES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "poetry.lock", "Pipfile.lock"}
 
+REVIEW_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": "One sentence overall assessment of the PR",
+        },
+        "suggestions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["critical", "warning", "suggestion", "praise"],
+                    },
+                    "rule": {"type": "string", "default": ""},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["file", "line", "severity", "title", "body"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "suggestions"],
+    "additionalProperties": False,
+}
+
 
 # ---------------------------------------------------------------------------
 # Tool definitions (what Claude can call)
@@ -733,31 +764,40 @@ def live_review(context: dict, config: dict):
         is_final_round = (round_num == max_rounds - 1)
         round_label = f"  Round {round_num + 1}/{max_rounds}"
         if is_final_round:
-            round_label += " (final — no tools)"
+            round_label += " (final — structured JSON output)"
             messages.append({
                 "role": "user",
                 "content": (
                     "You have used all available tool rounds. "
-                    "Return your final JSON review now. "
-                    "Do not request any more tools — just output the JSON object."
+                    "Return your final JSON review now."
                 ),
             })
         print(f"{round_label}...")
 
+        api_kwargs: dict = {
+            "model": MODEL,
+            "max_tokens": MAX_TOKENS,
+            "system": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": messages,
+        }
+        if is_final_round:
+            api_kwargs["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": REVIEW_JSON_SCHEMA,
+                }
+            }
+        else:
+            api_kwargs["tools"] = TOOLS
+
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                tools=[] if is_final_round else TOOLS,
-                messages=messages,
-            )
+            response = client.messages.create(**api_kwargs)
         except Exception as e:
             print(f"ERROR: API call failed: {e}")
             OUTPUT_PATH.write_text(
