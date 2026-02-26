@@ -6,8 +6,9 @@ Generalized version: branding and risk paths are read from config.
 
 Comment handling follows CodeRabbit's proven pattern:
 1. Summary → editable issue comment (found by HTML tag, updated in place)
-2. Inline comments → deduplicated at same file:line, then posted as single review
-3. PENDING → Submit pattern for atomic review posting
+2. Inline comments → posted as a COMMENT review (never carries the verdict)
+3. Verdict (APPROVE / REQUEST_CHANGES / COMMENT) → posted as a separate review
+   with no inline comments, so resolving threads never invalidates an approval
 4. Batch fallback → if batch review 422s, post each comment individually
 
 Supports auto-approval: safe PRs get APPROVE, risky PRs need human review,
@@ -517,6 +518,84 @@ def _post_individual_comment(
 # Review posting
 # ---------------------------------------------------------------------------
 
+def _post_inline_comment_review(
+    repo: str, pr_number: str, head_sha: str | None,
+    api_comments: list[dict], review_header: str,
+):
+    """Post inline comments as a COMMENT review (never APPROVE).
+
+    Keeping comments separate from the verdict means resolving threads
+    or minimizing old reviews won't invalidate an approval.
+    """
+    review_payload: dict = {
+        "body": f"{review_header}\nInline comments from automated review.",
+        "event": "COMMENT",
+        "comments": [
+            {"path": c["path"], "line": c["line"], "side": c["side"], "body": c["body"]}
+            for c in api_comments
+        ],
+    }
+    if head_sha:
+        review_payload["commit_id"] = head_sha
+
+    payload_path = Path("/tmp/review-comments-payload.json")
+    payload_path.write_text(json.dumps(review_payload, ensure_ascii=False))
+
+    rc, _, stderr = _gh_api([
+        f"repos/{repo}/pulls/{pr_number}/reviews",
+        "--input", str(payload_path), "--method", "POST",
+    ], timeout=30)
+
+    if rc == 0:
+        print(f"  Inline comment review posted ({len(api_comments)} comments)")
+        return
+
+    # Fallback: post each comment individually
+    print(f"  Warning: Batch comment review failed: {stderr[:200]}. Falling back to individual comments.")
+    _delete_pending_review(repo, pr_number)
+
+    if not head_sha:
+        print("  Warning: No HEAD commit SHA — cannot post individual comments")
+        return
+
+    posted = 0
+    for comment in api_comments:
+        if _post_individual_comment(repo, pr_number, head_sha, comment):
+            posted += 1
+    print(f"  Fallback: {posted}/{len(api_comments)} comments posted individually")
+
+
+def _post_verdict_review(
+    repo: str, pr_number: str, head_sha: str | None,
+    event: str, review_header: str, inline_count: int,
+):
+    """Post the verdict (APPROVE / REQUEST_CHANGES / COMMENT) as a standalone review.
+
+    This review carries no inline comments, so minimizing or resolving
+    threads on the comment review won't affect the approval state.
+    """
+    detail = f"{inline_count} inline comment{'s' if inline_count != 1 else ''}" if inline_count else "no inline comments"
+    review_payload: dict = {
+        "body": f"{review_header}\nSee summary above for details. ({detail})",
+        "event": event,
+    }
+    if head_sha:
+        review_payload["commit_id"] = head_sha
+
+    payload_path = Path("/tmp/review-verdict-payload.json")
+    payload_path.write_text(json.dumps(review_payload, ensure_ascii=False))
+
+    rc, _, stderr = _gh_api([
+        f"repos/{repo}/pulls/{pr_number}/reviews",
+        "--input", str(payload_path), "--method", "POST",
+    ], timeout=30)
+
+    if rc == 0:
+        print(f"  Verdict review posted (event={event})")
+    else:
+        print(f"  Warning: Failed to post verdict review: {stderr[:200]}")
+
+
 def post_review_via_gh(
     pr_number: str,
     summary: str,
@@ -604,86 +683,13 @@ def post_review_via_gh(
             "body": c["body"],
         })
 
-    if not api_comments:
-        review_payload = {
-            "body": f"{review_header}\nSee summary above for details.",
-            "event": event,
-        }
-        if head_sha:
-            review_payload["commit_id"] = head_sha
-        payload_path = Path("/tmp/review-payload.json")
-        payload_path.write_text(json.dumps(review_payload, ensure_ascii=False))
-        rc, _, stderr = _gh_api([
-            f"repos/{repo}/pulls/{pr_number}/reviews",
-            "--input", str(payload_path), "--method", "POST",
-        ], timeout=30)
-        if rc == 0:
-            print(f"  Review posted (event={event}, 0 inline comments)")
-        else:
-            print(f"  Warning: Failed to post review: {stderr[:200]}")
-        return
+    # Post inline comments as a separate COMMENT review so that resolving
+    # comment threads or minimizing old reviews never invalidates the approval.
+    if api_comments:
+        _post_inline_comment_review(repo, pr_number, head_sha, api_comments, review_header)
 
-    # Try batch
-    review_payload: dict = {
-        "comments": [
-            {"path": c["path"], "line": c["line"], "side": c["side"], "body": c["body"]}
-            for c in api_comments
-        ],
-    }
-    if head_sha:
-        review_payload["commit_id"] = head_sha
-    payload_path = Path("/tmp/review-payload.json")
-    payload_path.write_text(json.dumps(review_payload, ensure_ascii=False))
-
-    rc, stdout, stderr = _gh_api([
-        f"repos/{repo}/pulls/{pr_number}/reviews",
-        "--input", str(payload_path), "--method", "POST",
-    ], timeout=30)
-
-    if rc == 0:
-        review_id = None
-        try:
-            review_id = json.loads(stdout).get("id")
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-        if review_id:
-            submit_payload = {
-                "body": f"{review_header}\nSee summary above for details.",
-                "event": event,
-            }
-            submit_path = Path("/tmp/review-submit.json")
-            submit_path.write_text(json.dumps(submit_payload, ensure_ascii=False))
-
-            src, _, sstderr = _gh_api([
-                f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/events",
-                "--input", str(submit_path), "--method", "POST",
-            ], timeout=30)
-
-            if src == 0:
-                print(f"  Review submitted (event={event}, {len(api_comments)} inline comments)")
-            else:
-                print(f"  Warning: Failed to submit review: {sstderr[:200]}")
-                _gh_api([
-                    f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}",
-                    "--method", "DELETE",
-                ])
-        else:
-            print("  Review created but couldn't extract ID")
-    else:
-        # Fallback: individual comments
-        print(f"  Warning: Failed to create review: {stderr[:200]}. Falling back to individual comments.")
-        _delete_pending_review(repo, pr_number)
-
-        if not head_sha:
-            print("  Warning: No HEAD commit SHA — cannot post individual comments")
-            return
-
-        posted = 0
-        for comment in api_comments:
-            if _post_individual_comment(repo, pr_number, head_sha, comment):
-                posted += 1
-        print(f"  Comment {posted}/{len(api_comments)} posted")
+    # Post the approval/request-changes/comment verdict as its own review
+    _post_verdict_review(repo, pr_number, head_sha, event, review_header, len(api_comments))
 
 
 # ---------------------------------------------------------------------------
