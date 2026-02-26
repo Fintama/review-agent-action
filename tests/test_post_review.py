@@ -1,8 +1,9 @@
-"""Tests for post-review.py — diff parsing, comment resolution, risk assessment."""
+"""Tests for post-review.py — diff parsing, comment resolution, risk assessment, review posting."""
 
 import json
 import pytest
 import os
+from unittest.mock import patch, call
 
 os.environ.setdefault("GITHUB_WORKSPACE", "/tmp/test-repo")
 
@@ -281,3 +282,210 @@ class TestRiskAssessment:
             files, {}, [], {},
         )
         assert is_risky
+
+
+# ---------------------------------------------------------------------------
+# Review posting — verify verdict is decoupled from inline comments
+# ---------------------------------------------------------------------------
+
+def _make_gh_api_mock(responses=None):
+    """Build a _gh_api mock that returns canned responses by endpoint pattern."""
+    responses = responses or {}
+    default = (0, "{}", "")
+
+    def fake_gh_api(args, timeout=15):
+        endpoint = args[0] if args else ""
+        for pattern, resp in responses.items():
+            if pattern in endpoint:
+                return resp
+        return default
+
+    return fake_gh_api
+
+
+class TestPostVerdictReview:
+    """The verdict review (APPROVE/REQUEST_CHANGES/COMMENT) must be posted
+    as a standalone review with no inline comments attached."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        import importlib
+        self.mod = importlib.import_module("post-review")
+
+    def test_verdict_review_has_no_comments_field(self):
+        """The verdict payload must never include a 'comments' key."""
+        payloads_written = []
+        original_write = json.dumps
+
+        def capture_payload(obj, **kw):
+            payloads_written.append(obj)
+            return original_write(obj, **kw)
+
+        with patch.object(self.mod, "_gh_api", return_value=(0, "{}", "")), \
+             patch("json.dumps", side_effect=capture_payload):
+            self.mod._post_verdict_review(
+                "owner/repo", "1", "abc123", "APPROVE", "## Code Review", 3,
+            )
+
+        verdict_payload = payloads_written[-1]
+        assert "comments" not in verdict_payload
+        assert verdict_payload["event"] == "APPROVE"
+        assert verdict_payload["commit_id"] == "abc123"
+
+    def test_verdict_review_works_without_head_sha(self):
+        payloads_written = []
+        original_write = json.dumps
+
+        def capture_payload(obj, **kw):
+            payloads_written.append(obj)
+            return original_write(obj, **kw)
+
+        with patch.object(self.mod, "_gh_api", return_value=(0, "{}", "")), \
+             patch("json.dumps", side_effect=capture_payload):
+            self.mod._post_verdict_review(
+                "owner/repo", "1", None, "APPROVE", "## Code Review", 0,
+            )
+
+        verdict_payload = payloads_written[-1]
+        assert "commit_id" not in verdict_payload
+        assert verdict_payload["event"] == "APPROVE"
+
+
+class TestPostInlineCommentReview:
+    """Inline comments must be posted as a COMMENT review, never APPROVE."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        import importlib
+        self.mod = importlib.import_module("post-review")
+
+    def test_inline_review_always_uses_comment_event(self):
+        payloads_written = []
+        original_write = json.dumps
+
+        def capture_payload(obj, **kw):
+            payloads_written.append(obj)
+            return original_write(obj, **kw)
+
+        comments = [
+            {"path": "src/a.py", "line": 10, "side": "RIGHT", "body": "fix this"},
+        ]
+
+        with patch.object(self.mod, "_gh_api", return_value=(0, "{}", "")), \
+             patch("json.dumps", side_effect=capture_payload):
+            self.mod._post_inline_comment_review(
+                "owner/repo", "1", "abc123", comments, "## Code Review",
+            )
+
+        comment_payload = payloads_written[-1]
+        assert comment_payload["event"] == "COMMENT"
+        assert len(comment_payload["comments"]) == 1
+
+    def test_inline_review_falls_back_to_individual_on_failure(self):
+        call_log = []
+
+        def tracking_gh_api(args, timeout=15):
+            endpoint = args[0] if args else ""
+            call_log.append(endpoint)
+            if "reviews" in endpoint and "--method" not in args:
+                return (0, "{}", "")
+            if endpoint.endswith("/reviews") and "POST" in args:
+                return (1, "", "422 Validation Failed")
+            if endpoint.endswith("/comments") and "POST" in args:
+                return (0, "{}", "")
+            if "PENDING" in str(args):
+                return (0, "", "")
+            return (0, "{}", "")
+
+        comments = [
+            {"path": "src/a.py", "line": 10, "side": "RIGHT", "body": "fix"},
+        ]
+
+        with patch.object(self.mod, "_gh_api", side_effect=tracking_gh_api):
+            self.mod._post_inline_comment_review(
+                "owner/repo", "1", "abc123", comments, "## Code Review",
+            )
+
+
+class TestPostReviewViaGhIntegration:
+    """post_review_via_gh must post inline comments and verdict as separate reviews."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        import importlib
+        self.mod = importlib.import_module("post-review")
+
+    @patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"})
+    def test_approve_with_comments_posts_two_reviews(self):
+        """An APPROVE with inline comments should produce two API calls:
+        one COMMENT review for inline comments, one APPROVE review for the verdict."""
+        api_calls = []
+
+        def tracking_gh_api(args, timeout=15):
+            endpoint = args[0] if args else ""
+            api_calls.append({"endpoint": endpoint, "args": args})
+            if "pulls" in endpoint and endpoint.endswith("/reviews"):
+                if "--jq" in args:
+                    return (0, "[]", "")
+                return (0, '{"id": 999}', "")
+            if "issues" in endpoint and "comments" in endpoint:
+                if "--jq" in args:
+                    return (0, "", "")
+                return (0, '{"id": 1}', "")
+            if endpoint.endswith(".sha"):
+                return (0, "abc123", "")
+            return (0, "{}", "")
+
+        suggestions = [{"severity": "suggestion", "title": "Tip", "body": "Do X", "file": "src/a.py", "line": 10}]
+        diff_line_sets = {"src/a.py": {10, 11, 12}}
+        config = {"review": {"auto_approve_enabled": True}}
+
+        with patch.object(self.mod, "_gh_api", side_effect=tracking_gh_api):
+            self.mod.post_review_via_gh(
+                "1", "All good", suggestions, diff_line_sets,
+                changed_files=["src/a.py"], diff_stats={},
+                diff_content="", config=config,
+            )
+
+        review_posts = [
+            c for c in api_calls
+            if c["endpoint"].endswith("/reviews")
+            and "--method" in c["args"] and "POST" in c["args"]
+            and "--jq" not in c["args"]
+        ]
+        assert len(review_posts) == 2, f"Expected 2 review POSTs, got {len(review_posts)}"
+
+    @patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"})
+    def test_approve_without_comments_posts_one_review(self):
+        """An APPROVE with no inline comments should produce only the verdict review."""
+        api_calls = []
+
+        def tracking_gh_api(args, timeout=15):
+            endpoint = args[0] if args else ""
+            api_calls.append({"endpoint": endpoint, "args": args})
+            if "pulls" in endpoint and endpoint.endswith("/reviews"):
+                if "--jq" in args:
+                    return (0, "[]", "")
+                return (0, '{"id": 999}', "")
+            if "issues" in endpoint and "comments" in endpoint:
+                if "--jq" in args:
+                    return (0, "", "")
+                return (0, '{"id": 1}', "")
+            return (0, "{}", "")
+
+        config = {"review": {"auto_approve_enabled": True}}
+
+        with patch.object(self.mod, "_gh_api", side_effect=tracking_gh_api):
+            self.mod.post_review_via_gh(
+                "1", "All good", [], {},
+                changed_files=[], diff_stats={},
+                diff_content="", config=config,
+            )
+
+        review_posts = [
+            c for c in api_calls
+            if c["endpoint"].endswith("/reviews")
+            and "--method" in c["args"] and "POST" in c["args"]
+            and "--jq" not in c["args"]
+        ]
+        assert len(review_posts) == 1, f"Expected 1 review POST, got {len(review_posts)}"
