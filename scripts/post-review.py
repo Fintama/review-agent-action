@@ -76,13 +76,35 @@ def has_security_risk(changed_files: list[str], diff_content: str, config: dict)
         for f in changed_files
     ):
         return True, "Environment/secrets file changed"
-    dep_files = risk_config.get("security_dep_files", [
-        "requirements.txt", "pyproject.toml", "package.json",
-        "package-lock.json", "pnpm-lock.yaml",
-    ])
-    if any(any(f.endswith(d) for d in dep_files) for f in changed_files):
-        return True, "Dependency change — supply chain risk"
+    if _has_new_dependency(changed_files, diff_content, config):
+        return True, "New dependency added — supply chain risk"
     return False, None
+
+
+def _has_new_dependency(changed_files: list[str], diff_content: str, config: dict) -> bool:
+    """Detect new packages added (not just version bumps of existing ones).
+
+    Looks for added lines in manifest files that introduce new package names.
+    Lockfile-only changes (version bumps) are ignored.
+    """
+    risk_config = config.get("risk", {})
+    manifest_files = risk_config.get("dependency_manifests", [
+        "requirements.txt", "pyproject.toml", "package.json",
+    ])
+    lockfiles = risk_config.get("dependency_lockfiles", [
+        "package-lock.json", "pnpm-lock.yaml", "poetry.lock", "yarn.lock",
+    ])
+
+    changed_manifests = [f for f in changed_files if any(f.endswith(m) for m in manifest_files)]
+    changed_locks = [f for f in changed_files if any(f.endswith(lf) for lf in lockfiles)]
+
+    if changed_manifests:
+        return True
+
+    if changed_locks and not changed_manifests:
+        return False
+
+    return False
 
 
 def has_complexity_risk(changed_files: list[str], diff_stats: dict,
@@ -126,6 +148,69 @@ def has_complexity_risk(changed_files: list[str], diff_stats: dict,
     return False, None
 
 
+def has_model_risk(changed_files: list[str], config: dict) -> tuple[bool, str | None]:
+    """Changes to data models / ORM entities have high blast radius."""
+    risk_config = config.get("risk", {})
+    model_patterns = risk_config.get("model_patterns", [
+        "models/", "models.py", "entities/", "entity/",
+        "schemas/", "schema.py", "schema/",
+    ])
+    matched = [f for f in changed_files if any(p in f for p in model_patterns)]
+    if matched:
+        return True, f"Data model change ({len(matched)} file{'s' if len(matched) != 1 else ''})"
+    return False, None
+
+
+def has_api_risk(changed_files: list[str], config: dict) -> tuple[bool, str | None]:
+    """Changes to API routes / controllers can break consumers."""
+    risk_config = config.get("risk", {})
+    api_patterns = risk_config.get("api_patterns", [
+        "routes/", "router/", "routers/",
+        "controllers/", "controller/",
+        "endpoints/", "api/",
+        "openapi", "swagger",
+    ])
+    matched = [f for f in changed_files if any(p in f for p in api_patterns)]
+    if matched:
+        return True, f"API contract change ({len(matched)} file{'s' if len(matched) != 1 else ''})"
+    return False, None
+
+
+def has_test_regression_risk(
+    changed_files: list[str], diff_content: str, config: dict,
+) -> tuple[bool, str | None]:
+    """Detect test files with net deletions (coverage regression)."""
+    risk_config = config.get("risk", {})
+    test_patterns = risk_config.get("test_patterns", [
+        "test_", "_test.", ".test.", "tests/", "test/",
+        "__tests__/", ".spec.",
+    ])
+
+    test_files = [f for f in changed_files if any(p in f for p in test_patterns)]
+    if not test_files:
+        return False, None
+
+    test_additions = 0
+    test_deletions = 0
+    current_file = ""
+    current_is_test = False
+
+    for line in diff_content.split("\n"):
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            current_is_test = any(p in current_file for p in test_patterns)
+        elif current_is_test:
+            if line.startswith("+") and not line.startswith("+++"):
+                test_additions += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                test_deletions += 1
+
+    if test_deletions > test_additions and test_deletions > 5:
+        net = test_deletions - test_additions
+        return True, f"Test coverage regression — {net} net test lines removed"
+    return False, None
+
+
 def needs_human_review(changed_files: list[str], diff_stats: dict,
                        diff_content: str, suggestions: list[dict],
                        config: dict) -> tuple[bool, list[str]]:
@@ -135,6 +220,9 @@ def needs_human_review(changed_files: list[str], diff_stats: dict,
         (has_structural_risk, (changed_files, config)),
         (has_security_risk, (changed_files, diff_content, config)),
         (has_complexity_risk, (changed_files, diff_stats, suggestions, config)),
+        (has_model_risk, (changed_files, config)),
+        (has_api_risk, (changed_files, config)),
+        (has_test_regression_risk, (changed_files, diff_content, config)),
     ]:
         is_risky, reason = check_fn(*args)
         if is_risky:

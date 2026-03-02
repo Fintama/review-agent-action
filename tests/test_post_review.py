@@ -283,6 +283,117 @@ class TestRiskAssessment:
         )
         assert is_risky
 
+    # --- Dependency risk (smart check) ---
+
+    def test_dependency_manifest_change_is_risky(self):
+        is_risky, reason = self.mod.has_security_risk(
+            ["package.json"], "", {},
+        )
+        assert is_risky
+        assert "dependency" in reason.lower()
+
+    def test_lockfile_only_change_is_safe(self):
+        is_risky, _ = self.mod.has_security_risk(
+            ["pnpm-lock.yaml"], "", {},
+        )
+        assert not is_risky
+
+    def test_lockfile_with_manifest_is_risky(self):
+        is_risky, _ = self.mod.has_security_risk(
+            ["package.json", "pnpm-lock.yaml"], "", {},
+        )
+        assert is_risky
+
+    # --- Model risk ---
+
+    def test_model_file_is_risky(self):
+        is_risky, reason = self.mod.has_model_risk(
+            ["backend/models/user.py"], {},
+        )
+        assert is_risky
+        assert "model" in reason.lower()
+
+    def test_entity_file_is_risky(self):
+        is_risky, _ = self.mod.has_model_risk(
+            ["src/entities/contact.ts"], {},
+        )
+        assert is_risky
+
+    def test_no_model_risk(self):
+        is_risky, _ = self.mod.has_model_risk(
+            ["src/utils.py", "src/helpers.ts"], {},
+        )
+        assert not is_risky
+
+    # --- API risk ---
+
+    def test_api_route_is_risky(self):
+        is_risky, reason = self.mod.has_api_risk(
+            ["backend/routes/users.py"], {},
+        )
+        assert is_risky
+        assert "api" in reason.lower()
+
+    def test_controller_is_risky(self):
+        is_risky, _ = self.mod.has_api_risk(
+            ["src/controllers/auth.ts"], {},
+        )
+        assert is_risky
+
+    def test_no_api_risk(self):
+        is_risky, _ = self.mod.has_api_risk(
+            ["src/utils.py", "src/components/Button.tsx"], {},
+        )
+        assert not is_risky
+
+    # --- Test regression risk ---
+
+    def test_net_test_deletion_is_risky(self):
+        diff = (
+            "+++ b/tests/test_auth.py\n"
+            "-deleted test line 1\n"
+            "-deleted test line 2\n"
+            "-deleted test line 3\n"
+            "-deleted test line 4\n"
+            "-deleted test line 5\n"
+            "-deleted test line 6\n"
+        )
+        is_risky, reason = self.mod.has_test_regression_risk(
+            ["tests/test_auth.py"], diff, {},
+        )
+        assert is_risky
+        assert "regression" in reason.lower()
+
+    def test_test_addition_is_safe(self):
+        diff = (
+            "+++ b/tests/test_auth.py\n"
+            "+new test line 1\n"
+            "+new test line 2\n"
+        )
+        is_risky, _ = self.mod.has_test_regression_risk(
+            ["tests/test_auth.py"], diff, {},
+        )
+        assert not is_risky
+
+    def test_no_test_files_is_safe(self):
+        is_risky, _ = self.mod.has_test_regression_risk(
+            ["src/utils.py"], "", {},
+        )
+        assert not is_risky
+
+    def test_small_test_deletion_is_safe(self):
+        """Removing 3 lines from tests is not flagged (threshold is >5)."""
+        diff = (
+            "+++ b/tests/test_auth.py\n"
+            "-line1\n"
+            "-line2\n"
+            "-line3\n"
+        )
+        is_risky, _ = self.mod.has_test_regression_risk(
+            ["tests/test_auth.py"], diff, {},
+        )
+        assert not is_risky
+
 
 # ---------------------------------------------------------------------------
 # Review posting — verify verdict is decoupled from inline comments
