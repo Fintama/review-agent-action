@@ -754,6 +754,27 @@ def _post_check_run(
     else:
         print(f"  Warning: Failed to post check run: {stderr[:200]}")
 
+    _clear_legacy_commit_status(repo, head_sha)
+
+
+def _clear_legacy_commit_status(repo: str, head_sha: str):
+    """Overwrite any old "Review Agent" commit status with success.
+
+    We migrated from commit statuses to check runs. Old statuses linger
+    and show as red X if not cleared.
+    """
+    payload = {
+        "state": "success",
+        "description": "Migrated to check runs",
+        "context": CHECK_RUN_NAME,
+    }
+    payload_path = Path("/tmp/legacy-status-clear.json")
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False))
+    _gh_api([
+        f"repos/{repo}/statuses/{head_sha}",
+        "--input", str(payload_path), "--method", "POST",
+    ])
+
 
 def post_review_via_gh(
     pr_number: str,
