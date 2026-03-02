@@ -684,7 +684,7 @@ def _post_verdict_review(
         print(f"  Warning: Failed to post verdict review: {stderr[:200]}")
 
 
-STATUS_CHECK_NAME = "Review Agent"
+CHECK_RUN_NAME = "Review Agent"
 
 
 def _has_human_approval(repo: str, pr_number: str) -> bool:
@@ -699,51 +699,60 @@ def _has_human_approval(repo: str, pr_number: str) -> bool:
         return False
 
 
-def _post_commit_status(
+def _post_check_run(
     repo: str, pr_number: str, head_sha: str, event: str,
 ):
-    """Post a commit status that gates merges via required status checks.
+    """Post a check run that gates merges via required status checks.
 
-    - APPROVE -> success (bot approved, no human needed)
-    - COMMENT/REQUEST_CHANGES -> failure UNLESS a human already approved,
-      in which case -> success (human overrides bot)
+    Uses check runs instead of commit statuses so that "human review required"
+    shows as a neutral grey dot instead of a red X failure.
+
+    - APPROVE -> conclusion: success (green checkmark)
+    - COMMENT -> conclusion: neutral (grey dot, blocks merge but not alarming)
+    - REQUEST_CHANGES -> conclusion: action_required (orange, needs attention)
+    - Any of the above with existing human approval -> success
     """
     if not head_sha:
-        print("  Warning: No HEAD SHA — cannot post commit status")
+        print("  Warning: No HEAD SHA — cannot post check run")
         return
 
     if event == "APPROVE":
-        state = "success"
-        description = "Approved — no critical issues found"
+        conclusion = "success"
+        summary = "Approved — no critical issues found"
     else:
         if _has_human_approval(repo, pr_number):
-            state = "success"
-            description = "Approved by human reviewer"
+            conclusion = "success"
+            summary = "Approved by human reviewer"
             print("  Human approval found — overriding bot verdict")
         elif event == "REQUEST_CHANGES":
-            state = "failure"
-            description = "Changes requested — critical issues found"
+            conclusion = "action_required"
+            summary = "Changes requested — critical issues found"
         else:
-            state = "failure"
-            description = "Human review required"
+            conclusion = "neutral"
+            summary = "Human review required"
 
     payload = {
-        "state": state,
-        "description": description,
-        "context": STATUS_CHECK_NAME,
+        "name": CHECK_RUN_NAME,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": conclusion,
+        "output": {
+            "title": summary,
+            "summary": summary,
+        },
     }
-    payload_path = Path("/tmp/status-payload.json")
+    payload_path = Path("/tmp/check-run-payload.json")
     payload_path.write_text(json.dumps(payload, ensure_ascii=False))
 
     rc, _, stderr = _gh_api([
-        f"repos/{repo}/statuses/{head_sha}",
+        f"repos/{repo}/check-runs",
         "--input", str(payload_path), "--method", "POST",
     ])
 
     if rc == 0:
-        print(f"  Commit status posted ({state}: {description})")
+        print(f"  Check run posted ({conclusion}: {summary})")
     else:
-        print(f"  Warning: Failed to post commit status: {stderr[:200]}")
+        print(f"  Warning: Failed to post check run: {stderr[:200]}")
 
 
 def post_review_via_gh(
@@ -841,10 +850,10 @@ def post_review_via_gh(
     # Post the approval/request-changes/comment verdict as its own review
     _post_verdict_review(repo, pr_number, head_sha, event, review_header, len(api_comments))
 
-    # Post commit status so the verdict can gate merges via required status checks
+    # Post check run so the verdict can gate merges via required status checks
     # (GitHub doesn't count bot approvals toward required reviews)
     if head_sha:
-        _post_commit_status(repo, pr_number, head_sha, event)
+        _post_check_run(repo, pr_number, head_sha, event)
 
 
 # ---------------------------------------------------------------------------
