@@ -596,6 +596,46 @@ def _post_verdict_review(
         print(f"  Warning: Failed to post verdict review: {stderr[:200]}")
 
 
+STATUS_CHECK_NAME = "Review Agent"
+
+_EVENT_TO_STATUS = {
+    "APPROVE": ("success", "Approved — no critical issues found"),
+    "REQUEST_CHANGES": ("failure", "Changes requested — critical issues found"),
+    "COMMENT": ("success", "Reviewed — human review required"),
+}
+
+
+def _post_commit_status(repo: str, head_sha: str, event: str):
+    """Post a commit status so the review verdict can gate merges via required status checks.
+
+    GitHub rulesets don't count bot approvals toward required reviews,
+    so we use a commit status as the enforceable merge gate instead.
+    """
+    if not head_sha:
+        print("  Warning: No HEAD SHA — cannot post commit status")
+        return
+
+    state, description = _EVENT_TO_STATUS.get(event, ("success", "Review complete"))
+
+    payload = {
+        "state": state,
+        "description": description,
+        "context": STATUS_CHECK_NAME,
+    }
+    payload_path = Path("/tmp/status-payload.json")
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False))
+
+    rc, _, stderr = _gh_api([
+        f"repos/{repo}/statuses/{head_sha}",
+        "--input", str(payload_path), "--method", "POST",
+    ])
+
+    if rc == 0:
+        print(f"  Commit status posted ({state}: {description})")
+    else:
+        print(f"  Warning: Failed to post commit status: {stderr[:200]}")
+
+
 def post_review_via_gh(
     pr_number: str,
     summary: str,
@@ -690,6 +730,11 @@ def post_review_via_gh(
 
     # Post the approval/request-changes/comment verdict as its own review
     _post_verdict_review(repo, pr_number, head_sha, event, review_header, len(api_comments))
+
+    # Post commit status so the verdict can gate merges via required status checks
+    # (GitHub doesn't count bot approvals toward required reviews)
+    if head_sha:
+        _post_commit_status(repo, head_sha, event)
 
 
 # ---------------------------------------------------------------------------
