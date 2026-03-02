@@ -598,24 +598,46 @@ def _post_verdict_review(
 
 STATUS_CHECK_NAME = "Review Agent"
 
-_EVENT_TO_STATUS = {
-    "APPROVE": ("success", "Approved — no critical issues found"),
-    "REQUEST_CHANGES": ("failure", "Changes requested — critical issues found"),
-    "COMMENT": ("success", "Reviewed — human review required"),
-}
+
+def _has_human_approval(repo: str, pr_number: str) -> bool:
+    """Check if any human (non-bot) has approved this PR."""
+    rc, stdout, _ = _gh_api([
+        f"repos/{repo}/pulls/{pr_number}/reviews",
+        "--jq", '[.[] | select(.state == "APPROVED" and .user.type != "Bot")] | length',
+    ])
+    try:
+        return rc == 0 and int(stdout.strip()) > 0
+    except (ValueError, AttributeError):
+        return False
 
 
-def _post_commit_status(repo: str, head_sha: str, event: str):
-    """Post a commit status so the review verdict can gate merges via required status checks.
+def _post_commit_status(
+    repo: str, pr_number: str, head_sha: str, event: str,
+):
+    """Post a commit status that gates merges via required status checks.
 
-    GitHub rulesets don't count bot approvals toward required reviews,
-    so we use a commit status as the enforceable merge gate instead.
+    - APPROVE -> success (bot approved, no human needed)
+    - COMMENT/REQUEST_CHANGES -> failure UNLESS a human already approved,
+      in which case -> success (human overrides bot)
     """
     if not head_sha:
         print("  Warning: No HEAD SHA — cannot post commit status")
         return
 
-    state, description = _EVENT_TO_STATUS.get(event, ("success", "Review complete"))
+    if event == "APPROVE":
+        state = "success"
+        description = "Approved — no critical issues found"
+    else:
+        if _has_human_approval(repo, pr_number):
+            state = "success"
+            description = "Approved by human reviewer"
+            print("  Human approval found — overriding bot verdict")
+        elif event == "REQUEST_CHANGES":
+            state = "failure"
+            description = "Changes requested — critical issues found"
+        else:
+            state = "failure"
+            description = "Human review required"
 
     payload = {
         "state": state,
@@ -734,7 +756,7 @@ def post_review_via_gh(
     # Post commit status so the verdict can gate merges via required status checks
     # (GitHub doesn't count bot approvals toward required reviews)
     if head_sha:
-        _post_commit_status(repo, head_sha, event)
+        _post_commit_status(repo, pr_number, head_sha, event)
 
 
 # ---------------------------------------------------------------------------
