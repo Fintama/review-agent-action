@@ -278,7 +278,13 @@ def determine_review_event(suggestions: list[dict], changed_files: list[str],
 # ---------------------------------------------------------------------------
 
 def get_diff_line_sets(diff_text: str) -> dict[str, set[int]]:
-    """Parse diff to find which absolute line numbers are commentable."""
+    """Parse diff to find which absolute line numbers are commentable.
+
+    Only added/modified lines (starting with +) are commentable.
+    Context lines (starting with space) are tracked for line counting
+    but NOT included in the commentable set, preventing comments on
+    unchanged code that merely appears as diff context.
+    """
     line_sets: dict[str, set[int]] = {}
     current_file: str | None = None
     current_new_line = 0
@@ -294,9 +300,12 @@ def get_diff_line_sets(diff_text: str) -> dict[str, set[int]]:
             if match:
                 current_new_line = int(match.group(1)) - 1
         elif current_file is not None:
-            if line.startswith("+") or line.startswith(" "):
+            if line.startswith("+"):
                 current_new_line += 1
                 line_sets.setdefault(current_file, set()).add(current_new_line)
+            elif line.startswith(" "):
+                current_new_line += 1
+                # Context lines: advance counter but don't add to commentable set
             elif line.startswith("-"):
                 pass
 
@@ -880,9 +889,14 @@ def post_review_via_gh(
     # In incremental mode, only post inline comments on push-changed files
     is_incremental = review_scope == "incremental"
     push_file_set = set(push_changed_files) if push_changed_files else set()
+    changed_file_set = set(changed_files) if changed_files else set()
 
     for s in suggestions:
         file_path = s.get("file", "")
+
+        # Drop suggestions for files not in the PR diff at all
+        if changed_file_set and file_path not in changed_file_set:
+            continue
 
         # Skip inline comments for files not in this push (incremental mode)
         if is_incremental and push_file_set and file_path not in push_file_set:

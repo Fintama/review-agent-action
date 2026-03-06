@@ -411,6 +411,15 @@ False positives destroy trust. One wrong comment costs more credibility than ten
 
 When in doubt, **say nothing**. An empty review with "Ship it!" is a perfectly good review.
 
+## Comment Scope — ONLY comment on changed code
+
+You MUST only post inline suggestions on lines that were actually added or modified in this PR (lines starting with `+` in the diff). Do NOT comment on:
+- Context lines (unchanged code shown for surrounding context in diff hunks)
+- Files that are not in the PR's changed file list
+- Pre-existing issues in unchanged code, even if visible in the diff context
+
+If you see an issue in unchanged context code, it is OUT OF SCOPE. You may mention it briefly in the summary, but do NOT post an inline suggestion for it.
+
 ## How to Investigate
 
 1. READ the PR diff carefully — understand what changed and why.

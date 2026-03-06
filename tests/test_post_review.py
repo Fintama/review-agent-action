@@ -29,9 +29,10 @@ class TestGetDiffLineSets:
         )
         result = self.mod.get_diff_line_sets(diff)
         assert "src/a.py" in result
-        assert 10 in result["src/a.py"]
+        # Only the added line (11) is commentable, not context lines (10, 12)
         assert 11 in result["src/a.py"]
-        assert 12 in result["src/a.py"]
+        assert 10 not in result["src/a.py"], "Context lines should not be commentable"
+        assert 12 not in result["src/a.py"], "Context lines should not be commentable"
 
     def test_multiple_files(self):
         diff = (
