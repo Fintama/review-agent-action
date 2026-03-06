@@ -532,3 +532,292 @@ class TestIncrementalContextShape:
             pr_file.unlink(missing_ok=True)
             diff_file.unlink(missing_ok=True)
             output_file.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# post-review: severity parsing from bot comments
+# ---------------------------------------------------------------------------
+
+class TestParseSeverityFromComment:
+
+    def test_critical_icon_detected(self, post_mod):
+        body = "<!-- ai-review-agent -->\n\U0001f534 **Bug found**\n\nDetails"
+        assert post_mod._parse_severity_from_comment(body) == "critical"
+
+    def test_warning_icon_detected(self, post_mod):
+        body = "<!-- ai-review-agent -->\n\u26a0\ufe0f **Missing check**\n\nDetails"
+        assert post_mod._parse_severity_from_comment(body) == "warning"
+
+    def test_suggestion_icon_detected(self, post_mod):
+        body = "<!-- ai-review-agent -->\n\U0001f4a1 **Consider refactoring**\n\nDetails"
+        assert post_mod._parse_severity_from_comment(body) == "suggestion"
+
+    def test_praise_icon_detected(self, post_mod):
+        body = "<!-- ai-review-agent -->\n\u2b50 **Nice work**\n\nDetails"
+        assert post_mod._parse_severity_from_comment(body) == "praise"
+
+    def test_unknown_defaults_to_suggestion(self, post_mod):
+        body = "<!-- ai-review-agent -->\nSome comment without icon"
+        assert post_mod._parse_severity_from_comment(body) == "suggestion"
+
+
+# ---------------------------------------------------------------------------
+# post-review: outstanding comment classification
+# ---------------------------------------------------------------------------
+
+class TestCheckOutstandingComments:
+
+    def test_comment_on_changed_line_is_addressed(self, post_mod):
+        comments = [
+            {"id": 1, "path": "src/auth.py", "line": 42, "body": "\U0001f534 **Bug**"},
+        ]
+        # Push diff modifies src/auth.py around line 42
+        push_diff = (
+            "diff --git a/src/auth.py b/src/auth.py\n"
+            "+++ b/src/auth.py\n"
+            "@@ -40,5 +40,6 @@\n"
+            " context\n"
+            "+fix for the bug\n"
+            " context\n"
+        )
+        addressed, outstanding = post_mod._check_outstanding_comments(comments, push_diff)
+        assert len(addressed) == 1
+        assert len(outstanding) == 0
+
+    def test_comment_on_untouched_file_is_outstanding(self, post_mod):
+        comments = [
+            {"id": 1, "path": "src/auth.py", "line": 42, "body": "\U0001f534 **Bug**"},
+        ]
+        # Push diff only touches src/utils.py, not src/auth.py
+        push_diff = (
+            "diff --git a/src/utils.py b/src/utils.py\n"
+            "+++ b/src/utils.py\n"
+            "@@ -10,3 +10,4 @@\n"
+            "+new line\n"
+        )
+        addressed, outstanding = post_mod._check_outstanding_comments(comments, push_diff)
+        assert len(addressed) == 0
+        assert len(outstanding) == 1
+        assert outstanding[0]["_severity"] == "critical"
+
+    def test_comment_on_distant_line_is_outstanding(self, post_mod):
+        comments = [
+            {"id": 1, "path": "src/auth.py", "line": 42, "body": "\u26a0\ufe0f **Warning**"},
+        ]
+        # Push modifies src/auth.py but at line 200, far from line 42
+        push_diff = (
+            "diff --git a/src/auth.py b/src/auth.py\n"
+            "+++ b/src/auth.py\n"
+            "@@ -198,3 +198,4 @@\n"
+            "+unrelated change\n"
+        )
+        addressed, outstanding = post_mod._check_outstanding_comments(comments, push_diff)
+        assert len(addressed) == 0
+        assert len(outstanding) == 1
+
+    def test_empty_comments_returns_empty(self, post_mod):
+        addressed, outstanding = post_mod._check_outstanding_comments([], "")
+        assert addressed == []
+        assert outstanding == []
+
+    def test_mixed_addressed_and_outstanding(self, post_mod):
+        comments = [
+            {"id": 1, "path": "src/auth.py", "line": 42, "body": "\U0001f534 **Critical bug**"},
+            {"id": 2, "path": "src/utils.py", "line": 10, "body": "\u26a0\ufe0f **Warning**"},
+        ]
+        # Push fixes src/auth.py line 42 but doesn't touch src/utils.py
+        push_diff = (
+            "diff --git a/src/auth.py b/src/auth.py\n"
+            "+++ b/src/auth.py\n"
+            "@@ -40,5 +40,6 @@\n"
+            " context\n"
+            "+fix\n"
+            " context\n"
+        )
+        addressed, outstanding = post_mod._check_outstanding_comments(comments, push_diff)
+        assert len(addressed) == 1
+        assert addressed[0]["path"] == "src/auth.py"
+        assert len(outstanding) == 1
+        assert outstanding[0]["path"] == "src/utils.py"
+
+
+# ---------------------------------------------------------------------------
+# post-review: outstanding comments block auto-approve
+# ---------------------------------------------------------------------------
+
+class TestOutstandingCommentsBlockApprove:
+    """When incremental mode finds outstanding critical/warning comments from
+    a previous review, the verdict must be overridden to prevent auto-approve."""
+
+    def test_outstanding_critical_overrides_approve_to_request_changes(self, post_mod):
+        """If previous review had a critical on a file we didn't touch,
+        the verdict must stay REQUEST_CHANGES even if the new push is clean."""
+        existing_comments = [
+            {"id": 1, "path": "src/auth.py", "line": 42, "position": 1,
+             "body": "<!-- ai-review-agent -->\n\U0001f534 **SQL injection**\n\nFix it"},
+        ]
+        api_calls = []
+        deleted_ids = []
+
+        def tracking_gh_api(args, timeout=15):
+            endpoint = args[0] if args else ""
+            api_calls.append({"endpoint": endpoint, "args": args})
+            # Return the existing critical comment when listing
+            if "pulls" in endpoint and "comments" in endpoint and "--jq" in args:
+                return (0, json.dumps(existing_comments), "")
+            if "reviews" in endpoint and "--jq" in args:
+                return (0, "[]", "")
+            if "issues" in endpoint and "comments" in endpoint:
+                if "--jq" in args:
+                    return (0, "", "")
+                return (0, '{"id": 1}', "")
+            if endpoint.endswith("/comments/1") and "DELETE" in args:
+                deleted_ids.append(1)
+                return (0, "", "")
+            return (0, "{}", "")
+
+        config = {"review": {"auto_approve_enabled": True}}
+
+        # Write a push diff that doesn't touch src/auth.py
+        push_diff_path = Path("/tmp/push.diff")
+        try:
+            push_diff_path.write_text(
+                "diff --git a/src/utils.py b/src/utils.py\n"
+                "+++ b/src/utils.py\n"
+                "@@ -1,3 +1,4 @@\n"
+                "+clean change\n"
+            )
+
+            with patch.object(post_mod, "_gh_api", side_effect=tracking_gh_api), \
+                 patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}):
+                post_mod.post_review_via_gh(
+                    "1", "Ship it!", [], {"src/utils.py": {1, 2}},
+                    changed_files=["src/auth.py", "src/utils.py"],
+                    diff_stats={}, diff_content="", config=config,
+                    review_scope="incremental",
+                    push_changed_files=["src/utils.py"],
+                )
+
+            # The critical comment should NOT have been deleted (it's outstanding)
+            assert 1 not in deleted_ids, "Outstanding critical should not be deleted"
+
+            # The verdict review should be REQUEST_CHANGES, not APPROVE
+            verdict_posts = [
+                c for c in api_calls
+                if c["endpoint"].endswith("/reviews")
+                and "--method" in c["args"] and "POST" in c["args"]
+                and "--jq" not in c["args"]
+                and "--input" in c["args"]
+            ]
+            # Read the verdict payload to check the event
+            verdict_path = Path("/tmp/review-verdict-payload.json")
+            if verdict_path.exists():
+                verdict = json.loads(verdict_path.read_text())
+                assert verdict["event"] == "REQUEST_CHANGES", \
+                    f"Expected REQUEST_CHANGES due to outstanding critical, got {verdict['event']}"
+        finally:
+            push_diff_path.unlink(missing_ok=True)
+
+    def test_outstanding_warning_overrides_approve_to_comment(self, post_mod):
+        existing_comments = [
+            {"id": 2, "path": "src/models.py", "line": 100, "position": 1,
+             "body": "<!-- ai-review-agent -->\n\u26a0\ufe0f **Missing null check**\n\nDetails"},
+        ]
+
+        def tracking_gh_api(args, timeout=15):
+            endpoint = args[0] if args else ""
+            if "pulls" in endpoint and "comments" in endpoint and "--jq" in args:
+                return (0, json.dumps(existing_comments), "")
+            if "reviews" in endpoint and "--jq" in args:
+                return (0, "[]", "")
+            if "issues" in endpoint and "comments" in endpoint:
+                if "--jq" in args:
+                    return (0, "", "")
+                return (0, '{"id": 1}', "")
+            return (0, "{}", "")
+
+        config = {"review": {"auto_approve_enabled": True}}
+        push_diff_path = Path("/tmp/push.diff")
+        try:
+            push_diff_path.write_text(
+                "diff --git a/src/utils.py b/src/utils.py\n"
+                "+++ b/src/utils.py\n"
+                "@@ -1,3 +1,4 @@\n"
+                "+clean\n"
+            )
+
+            with patch.object(post_mod, "_gh_api", side_effect=tracking_gh_api), \
+                 patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}):
+                post_mod.post_review_via_gh(
+                    "1", "Ship it!", [], {"src/utils.py": {1, 2}},
+                    changed_files=["src/models.py", "src/utils.py"],
+                    diff_stats={}, diff_content="", config=config,
+                    review_scope="incremental",
+                    push_changed_files=["src/utils.py"],
+                )
+
+            verdict_path = Path("/tmp/review-verdict-payload.json")
+            if verdict_path.exists():
+                verdict = json.loads(verdict_path.read_text())
+                assert verdict["event"] == "COMMENT", \
+                    f"Expected COMMENT due to outstanding warning, got {verdict['event']}"
+        finally:
+            push_diff_path.unlink(missing_ok=True)
+
+    def test_addressed_critical_allows_approve(self, post_mod):
+        """If the push fixes the critical, auto-approve should proceed."""
+        existing_comments = [
+            {"id": 1, "path": "src/auth.py", "line": 42, "position": 1,
+             "body": "<!-- ai-review-agent -->\n\U0001f534 **SQL injection**\n\nFix it"},
+        ]
+        deleted_ids = []
+
+        def tracking_gh_api(args, timeout=15):
+            endpoint = args[0] if args else ""
+            if "pulls" in endpoint and "comments" in endpoint and "--jq" in args:
+                return (0, json.dumps(existing_comments), "")
+            if endpoint.endswith("/comments/1") and "DELETE" in args:
+                deleted_ids.append(1)
+                return (0, "", "")
+            if "reviews" in endpoint and "--jq" in args:
+                return (0, "[]", "")
+            if "issues" in endpoint and "comments" in endpoint:
+                if "--jq" in args:
+                    return (0, "", "")
+                return (0, '{"id": 1}', "")
+            return (0, "{}", "")
+
+        config = {"review": {"auto_approve_enabled": True}}
+        push_diff_path = Path("/tmp/push.diff")
+        try:
+            # Push diff modifies src/auth.py near line 42
+            push_diff_path.write_text(
+                "diff --git a/src/auth.py b/src/auth.py\n"
+                "+++ b/src/auth.py\n"
+                "@@ -40,5 +40,6 @@\n"
+                " context\n"
+                "+fixed the sql injection\n"
+                " context\n"
+            )
+
+            with patch.object(post_mod, "_gh_api", side_effect=tracking_gh_api), \
+                 patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}):
+                post_mod.post_review_via_gh(
+                    "1", "Ship it!", [], {"src/auth.py": {40, 41, 42, 43}},
+                    changed_files=["src/auth.py"],
+                    diff_stats={}, diff_content="", config=config,
+                    review_scope="incremental",
+                    push_changed_files=["src/auth.py"],
+                )
+
+            # The critical was addressed — it should be deleted
+            assert 1 in deleted_ids, "Addressed critical should be deleted"
+
+            # Verdict should be APPROVE
+            verdict_path = Path("/tmp/review-verdict-payload.json")
+            if verdict_path.exists():
+                verdict = json.loads(verdict_path.read_text())
+                assert verdict["event"] == "APPROVE", \
+                    f"Expected APPROVE after fixing critical, got {verdict['event']}"
+        finally:
+            push_diff_path.unlink(missing_ok=True)

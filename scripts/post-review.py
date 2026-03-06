@@ -557,7 +557,7 @@ def _list_existing_review_comments(repo: str, pr_number: str, branding: dict) ->
     comment_tag = branding.get("comment_tag", "<!-- ai-review-agent -->")
     rc, stdout, _ = _gh_api([
         f"repos/{repo}/pulls/{pr_number}/comments",
-        "--jq", f'[.[] | select(.body | contains("{comment_tag}")) | {{id: .id, path: .path, line: .line, position: .position}}]',
+        "--jq", f'[.[] | select(.body | contains("{comment_tag}")) | {{id: .id, path: .path, line: .line, position: .position, body: .body}}]',
     ])
     if rc == 0 and stdout.strip():
         try:
@@ -565,6 +565,51 @@ def _list_existing_review_comments(repo: str, pr_number: str, branding: dict) ->
         except json.JSONDecodeError:
             return []
     return []
+
+
+def _parse_severity_from_comment(body: str) -> str:
+    """Extract severity from a bot inline comment body.
+
+    Comments are formatted as: <!-- tag -->\n{icon} **{title}**...
+    We match the icon to determine severity.
+    """
+    for severity, icon in SEVERITY_ICONS.items():
+        if severity == "consider":
+            continue
+        if icon in body:
+            return severity
+    return "suggestion"
+
+
+def _check_outstanding_comments(
+    existing_comments: list[dict],
+    push_diff_text: str,
+) -> tuple[list[dict], list[dict]]:
+    """Classify existing bot comments as addressed or outstanding.
+
+    A comment is addressed if the push modified lines near it.
+    A comment is outstanding if its file wasn't touched or the lines weren't changed.
+
+    Returns (addressed, outstanding).
+    """
+    if not existing_comments:
+        return [], []
+
+    push_changed_ranges = get_changed_line_ranges(push_diff_text)
+
+    addressed = []
+    outstanding = []
+    for comment in existing_comments:
+        path = comment.get("path", "")
+        line = comment.get("line") or 0
+        severity = _parse_severity_from_comment(comment.get("body", ""))
+
+        if is_comment_addressed(path, line, push_changed_ranges):
+            addressed.append({**comment, "_severity": severity})
+        else:
+            outstanding.append({**comment, "_severity": severity})
+
+    return addressed, outstanding
 
 
 def _delete_review_comment(repo: str, comment_id: int):
@@ -860,25 +905,58 @@ def post_review_via_gh(
         else:
             unplaced.append(s)
 
-    # Step 2: Minimize old reviews
-    _minimize_old_reviews(repo, pr_number, branding)
-
-    # Step 3: Upsert summary
-    summary_body = build_summary_body(
-        summary, suggestions, event, event_reasons, stats, unplaced, branding,
-        review_scope=review_scope,
-    )
-    _upsert_summary_comment(repo, pr_number, summary_body, branding)
-
-    # Step 4: Delete old bot inline comments
+    # Step 2: Handle existing bot comments (incremental: check outstanding, full: delete all)
     existing_comments = _list_existing_review_comments(repo, pr_number, branding)
-    if existing_comments:
+    outstanding_comments: list[dict] = []
+
+    if is_incremental and existing_comments:
+        # Read the push diff to determine which comments were addressed
+        push_diff_path = Path("/tmp/push.diff")
+        push_diff_text = push_diff_path.read_text(errors="replace") if push_diff_path.exists() else ""
+
+        addressed, outstanding_comments = _check_outstanding_comments(existing_comments, push_diff_text)
+
+        # Delete only addressed comments (the issue was fixed in this push)
+        for ac in addressed:
+            _delete_review_comment(repo, ac["id"])
+        if addressed:
+            print(f"  Resolved {len(addressed)} addressed comment(s)")
+
+        if outstanding_comments:
+            outstanding_severities = [c["_severity"] for c in outstanding_comments]
+            print(f"  Outstanding comments: {len(outstanding_comments)} "
+                  f"({', '.join(outstanding_severities)})")
+
+            # Outstanding criticals/warnings must block auto-approve
+            has_outstanding_critical = any(c["_severity"] == "critical" for c in outstanding_comments)
+            has_outstanding_warning = any(c["_severity"] == "warning" for c in outstanding_comments)
+
+            if has_outstanding_critical and event == "APPROVE":
+                event = "REQUEST_CHANGES"
+                event_reasons = ["Outstanding critical from previous review not yet addressed"]
+                print(f"  Overriding verdict to REQUEST_CHANGES (outstanding critical)")
+            elif has_outstanding_warning and event == "APPROVE":
+                event = "COMMENT"
+                event_reasons = ["Outstanding warning(s) from previous review not yet addressed"]
+                print(f"  Overriding verdict to COMMENT (outstanding warning)")
+    elif existing_comments:
+        # Full mode: delete all old comments (they'll be replaced)
         deleted = 0
         for ec in existing_comments:
             _delete_review_comment(repo, ec["id"])
             deleted += 1
         if deleted:
             print(f"  Deleted {deleted} old inline comment(s)")
+
+    # Step 3: Minimize old reviews
+    _minimize_old_reviews(repo, pr_number, branding)
+
+    # Step 4: Upsert summary
+    summary_body = build_summary_body(
+        summary, suggestions, event, event_reasons, stats, unplaced, branding,
+        review_scope=review_scope,
+    )
+    _upsert_summary_comment(repo, pr_number, summary_body, branding)
 
     # Step 5: Post review
     _delete_pending_review(repo, pr_number)
