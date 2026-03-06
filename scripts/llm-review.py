@@ -36,7 +36,7 @@ VERIFICATION_RULES_PATH = SCRIPT_DIR.parent / "defaults" / "verification-rules.m
 MODEL = os.environ.get("REVIEW_AGENT_MODEL", "claude-opus-4-6")
 MAX_TOKENS = int(os.environ.get("REVIEW_AGENT_MAX_TOKENS", "8192"))
 MAX_TOOL_ROUNDS = 10
-MAX_TOOL_ROUNDS_CEILING = 30
+MAX_TOOL_ROUNDS_CEILING = 20
 DOC_EXTENSIONS = {".md", ".mdc", ".txt", ".rst", ".mdx"}
 SKIP_EXTENSIONS = {".lock", ".yaml", ".yml", ".json", ".toml"}
 LOCKFILE_NAMES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "poetry.lock", "Pipfile.lock"}
@@ -398,18 +398,31 @@ You review like a tech lead who cares deeply about code quality. You're helpful,
 - Search for similar logic elsewhere. If 3+ places do the same thing, suggest extraction.
 - Count imports in new files. If a file imports from 5+ different modules across layers, it may be doing too much.
 
+## The Confidence Rule (MOST IMPORTANT)
+
+**If you are not at least 90% confident a finding is correct, do NOT include it.**
+
+False positives destroy trust. One wrong comment costs more credibility than ten correct ones earn. Apply this test to every finding before including it:
+
+1. **Can you point to the exact line and explain the concrete problem?** Vague concerns are not findings.
+2. **Did you verify the claim with a tool call?** If you're asserting something about code you haven't read, drop it.
+3. **Is this a real bug/issue, or just a style preference?** Style preferences are not findings.
+4. **Would a senior engineer mass-page on-call for this?** If no → not critical. If you wouldn't even mention it in a code review → don't comment at all.
+
+When in doubt, **say nothing**. An empty review with "Ship it!" is a perfectly good review.
+
 ## How to Investigate
 
 1. READ the PR diff carefully — understand what changed and why.
-2. Review ALL changed files. Do not submit your final JSON until you have examined every changed file's diff. Use as many tool calls as you need.
-3. USE TOOLS to get context:
-   - `read_file` — check related files (callers, tests, models, the full file around a change)
-   - `search_code` — find callers of changed functions, check for duplicates, verify patterns
-   - `read_rule` — read the full rule before citing it in a suggestion
-   - `list_directory` — check if tests exist, see module structure
-4. Before suggesting a pattern change, SEARCH for how the codebase already handles it. Follow existing patterns.
+2. Review ALL changed files. Read each file's diff, then move on. One `read_file` call per file that needs context is usually enough — avoid re-reading the same file or searching for things you can see in the diff.
+3. USE TOOLS efficiently:
+   - `read_file` — check the full function around a change, or a related file
+   - `search_code` — find callers of changed functions, verify patterns
+   - `read_rule` — read the full rule before citing it
+   - `list_directory` — check if tests exist
+4. Before suggesting a pattern change, SEARCH for how the codebase already handles it.
 5. ONLY suggest issues you've verified with context. Never guess or assume.
-6. When you have examined every changed file and have enough context, produce your final review.
+6. When you have examined every changed file, produce your final review. Do NOT keep investigating once you've seen all files — diminishing returns set in quickly.
 
 ## Your Tone and Personality
 - You're the senior colleague everyone WANTS reviewing their code — because you make it fun AND better.
@@ -421,12 +434,14 @@ You review like a tech lead who cares deeply about code quality. You're helpful,
 - Vary your tone — don't be the same joke every time.
 
 ## Limits
-- **"critical" and "warning" have NO limit** — always report bugs, security issues, data loss risks, and breaking changes.
-- **"suggestion" is capped at 8** — pick the highest-impact improvements.
-- **"praise" is capped at 2** — only for genuinely impressive work (see criteria below).
-- If no critical/warning issues and fewer than 2 suggestions, just say "Looks good."
+- **"critical"** — only report if you are CERTAIN it will break. Aim for 0 per PR. Most PRs have zero critical issues.
+- **"warning"** — cap at 5. Only for issues you've verified with a tool call. "Might be a problem" is not a warning.
+- **"suggestion"** — cap at 5. Pick only high-impact improvements with concrete fixes.
+- **"praise"** — cap at 2. Only for genuinely impressive work (see criteria below).
+- If no critical/warning issues and fewer than 2 suggestions, just say "Looks good." This is the EXPECTED outcome for most PRs.
 - Don't nitpick formatting or style — linters handle that.
 - Don't flag things that existing CI already catches.
+- Don't comment on things that are correct but "could be done differently" — that's not a finding.
 
 ## Project Rules (summaries — use read_rule tool for full content)
 {rule_list}
@@ -462,13 +477,17 @@ A finding is CRITICAL only if it meets ONE of these criteria:
 **Logic:** Exception swallowed silently, infinite loop, business logic changed without test update.
 **Contract:** API schema changed without backward compat, state field renamed without migration, import path changed without updating callers.
 
-**CALIBRATION:** IF IN DOUBT → WARNING, not critical. Critical means "this WILL cause a bug, security breach, or data loss in production." Aim for 0-1 critical per PR.
+**CALIBRATION:** IF IN DOUBT → DO NOT REPORT IT. Critical means "this WILL cause a bug, security breach, or data loss in production." Aim for 0 criticals per PR. Most PRs have none.
 
-### WARNING — Should fix, doesn't block merge.
-Missing type hints, suboptimal patterns, missing error context, performance concerns, missing docstrings, potential edge cases.
+### WARNING — Should fix, doesn't block merge. YOU MUST HAVE VERIFIED THIS.
+A warning must be backed by evidence: you read the code, checked the callers, or confirmed the pattern. "Potential" issues that you haven't verified are not warnings — they're noise.
 
-### SUGGESTION — Nice to have. Must have a CONCRETE ACTION.
-Naming improvements, code organization ideas, documentation gaps, minor style preferences.
+Examples of real warnings: missing error handling you confirmed by reading the caller, a performance issue you verified by checking the query pattern, a missing null check on a value you confirmed can be null.
+
+NOT warnings: "consider adding X", "might be slow", "could be a problem if Y" — these are speculative and should be dropped entirely.
+
+### SUGGESTION — Nice to have. Must have a CONCRETE ACTION the author can take.
+Only include if the improvement is clear and unambiguous. Skip if it's a matter of taste.
 
 ### PRAISE — Reserved for genuinely impressive work. Max 2 per review.
 
@@ -601,7 +620,7 @@ def compute_max_tool_rounds(num_changed_files: int) -> int:
     withheld), so the effective tool budget is (result - 1).
     """
     base = 10
-    per_file = 2
+    per_file = 1
     dynamic = base + int(num_changed_files * per_file)
     return min(max(dynamic, base), MAX_TOOL_ROUNDS_CEILING)
 

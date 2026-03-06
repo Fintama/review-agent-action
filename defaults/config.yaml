@@ -60,7 +60,6 @@ risk:
   infrastructure_patterns:             # Infra files → needs human review
     - "docker-compose"
     - "Dockerfile"
-    - ".github/workflows/"
     - "terraform/"
     - "k8s/"
   domain_paths: {}                     # For cross-cutting detection

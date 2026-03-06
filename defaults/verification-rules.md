@@ -107,10 +107,30 @@ Downgrade uncertain criticals to warning. Never let a shaky critical through.
 
 ---
 
+## 7. Confidence Gate
+
+**When in doubt, drop the finding.** Apply this final check to every surviving finding:
+
+- **Is this definitely correct, or just plausible?** Plausible findings get dropped.
+- **Would you bet $100 this is a real issue?** If not, drop it.
+- **Is this speculative?** Phrases like "might cause", "could lead to", "potential
+  issue" are red flags. Either make it concrete ("this WILL fail when X is null
+  because line Y dereferences it") or drop it.
+- **Is this a style preference disguised as a bug?** Different-but-correct approaches
+  are not findings. Drop them.
+
+**Calibration target:** It is better to return zero findings than one false positive.
+An empty suggestions list with a clean summary is the ideal outcome for most PRs.
+
+---
+
 ## Output
 
 Return the verified findings as a JSON object with the same schema as the input.
 Remove or fix any finding that fails verification. Preserve findings that pass.
 If you change a finding's severity, update it in place.
+
+**Be aggressive about dropping findings.** The goal is zero false positives, not
+maximum coverage. If you started with 5 findings and 3 are shaky, return 2.
 
 Return ONLY the JSON object — no commentary, no markdown fences.

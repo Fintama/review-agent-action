@@ -140,7 +140,7 @@ def has_complexity_risk(changed_files: list[str], diff_stats: dict,
             return True, f"Cross-cutting change ({', '.join(sorted(domains_touched))}) — needs architectural review"
 
     infra_patterns = risk_config.get("infrastructure_patterns", [
-        "docker-compose", "Dockerfile", ".github/workflows/",
+        "docker-compose", "Dockerfile",
     ])
     if any(any(p in f for p in infra_patterns) for f in changed_files):
         return True, "Infrastructure change — affects deployment"

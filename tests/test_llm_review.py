@@ -78,16 +78,16 @@ class TestComputeMaxToolRounds:
 
     def test_never_exceeds_hard_ceiling(self):
         result = self.mod.compute_max_tool_rounds(100)
-        assert result <= 30, "Hard ceiling should cap at 30"
+        assert result <= 20, "Hard ceiling should cap at 20"
 
     def test_zero_files_gets_minimum(self):
         result = self.mod.compute_max_tool_rounds(0)
         assert result >= 10
 
-    def test_five_files_gets_twenty_rounds(self):
-        """5-file PR: 10 base + 5*2 = 20 rounds (last one reserved for response)."""
+    def test_five_files_gets_fifteen_rounds(self):
+        """5-file PR: 10 base + 5*1 = 15 rounds (last one reserved for response)."""
         result = self.mod.compute_max_tool_rounds(5)
-        assert result == 20
+        assert result == 15
 
 
 # ---------------------------------------------------------------------------
