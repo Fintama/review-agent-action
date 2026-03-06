@@ -42,6 +42,10 @@ inputs:
     description: "Run without posting (for testing)"
     required: false
     default: "false"
+  incremental:
+    description: "Review only files changed in the latest push (synchronize events). Full PR diff is still provided as context."
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -77,16 +81,62 @@ runs:
         cat /tmp/changed-files.txt
         echo "Diff size: $(wc -l < /tmp/pr.diff) lines"
 
+    - name: Compute incremental diff
+      if: inputs.incremental == 'true' && github.event.action == 'synchronize'
+      shell: bash
+      run: |
+        BEFORE_SHA=${{ github.event.before }}
+        HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+        if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+          PUSH_FILES=$(git diff --name-only "$BEFORE_SHA" "$HEAD_SHA" 2>/dev/null || echo "")
+          if [ -n "$PUSH_FILES" ]; then
+            echo "$PUSH_FILES" > /tmp/push-changed-files.txt
+            git diff "$BEFORE_SHA" "$HEAD_SHA" > /tmp/push.diff
+            echo "Incremental review: $(echo "$PUSH_FILES" | wc -l) files changed in this push"
+          else
+            echo "No file changes in this push (rebase only)"
+            touch /tmp/rebase-only
+          fi
+        fi
+
+    - name: Skip review (rebase only)
+      id: rebase-check
+      if: inputs.incremental == 'true' && github.event.action == 'synchronize'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.token.outputs.value }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        if [ -f /tmp/rebase-only ]; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "Rebase-only push detected — posting success check run and skipping review"
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+            --method POST \
+            -f "name=Review Agent" \
+            -f "head_sha=$HEAD_SHA" \
+            -f "status=completed" \
+            -f "conclusion=success" \
+            -f "output[title]=Skipped — rebase only (no code changes)" \
+            -f "output[summary]=Skipped — rebase only (no code changes)"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Set up Python
+      if: steps.rebase-check.outputs.skip != 'true'
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
 
     - name: Install dependencies
+      if: steps.rebase-check.outputs.skip != 'true'
       shell: bash
       run: pip install -r ${{ github.action_path }}/requirements.txt
 
     - name: Prepare review context
+      if: steps.rebase-check.outputs.skip != 'true'
       shell: bash
       env:
         PR_BODY: ${{ github.event.pull_request.body }}
@@ -97,6 +147,7 @@ runs:
       run: python ${{ github.action_path }}/scripts/prepare-context.py
 
     - name: Run LLM review
+      if: steps.rebase-check.outputs.skip != 'true'
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
@@ -109,6 +160,7 @@ runs:
 
     - name: Post review
       id: post-review
+      if: steps.rebase-check.outputs.skip != 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.token.outputs.value }}
@@ -122,7 +174,7 @@ runs:
       run: python ${{ github.action_path }}/scripts/post-review.py
 
     - name: Notify on failure
-      if: steps.post-review.outcome == 'failure'
+      if: steps.rebase-check.outputs.skip != 'true' && steps.post-review.outcome == 'failure'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.token.outputs.value }}

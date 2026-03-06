@@ -381,6 +381,7 @@ def build_summary_body(
     event_reasons: list[str], stats: dict | None = None,
     unplaced: list[dict] | None = None,
     branding: dict | None = None,
+    review_scope: str = "full",
 ) -> str:
     """Build the summary comment body."""
     branding = branding or {}
@@ -394,6 +395,10 @@ def build_summary_body(
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
     parts = [review_header, ""]
+
+    if review_scope == "incremental":
+        parts.append("*Incremental review — only files changed in the latest push were reviewed.*")
+        parts.append("")
 
     if event == "APPROVE":
         parts.append("### \u2705 Auto-Approved")
@@ -786,6 +791,8 @@ def post_review_via_gh(
     diff_stats: dict | None = None,
     diff_content: str = "",
     config: dict | None = None,
+    review_scope: str = "full",
+    push_changed_files: list[str] | None = None,
 ):
     """Post review using CodeRabbit's exact pattern."""
     config = config or {}
@@ -809,9 +816,18 @@ def post_review_via_gh(
     inline_comments: list[dict] = []
     unplaced: list[dict] = []
 
+    # In incremental mode, only post inline comments on push-changed files
+    is_incremental = review_scope == "incremental"
+    push_file_set = set(push_changed_files) if push_changed_files else set()
+
     for s in suggestions:
-        formatted = f"{comment_tag}\n{format_suggestion_body(s)}"
         file_path = s.get("file", "")
+
+        # Skip inline comments for files not in this push (incremental mode)
+        if is_incremental and push_file_set and file_path not in push_file_set:
+            continue
+
+        formatted = f"{comment_tag}\n{format_suggestion_body(s)}"
         target_line = s.get("line", 0)
 
         commentable_lines = diff_line_sets.get(file_path, set())
@@ -834,6 +850,7 @@ def post_review_via_gh(
     # Step 3: Upsert summary
     summary_body = build_summary_body(
         summary, suggestions, event, event_reasons, stats, unplaced, branding,
+        review_scope=review_scope,
     )
     _upsert_summary_comment(repo, pr_number, summary_body, branding)
 
@@ -941,6 +958,8 @@ def main():
     summary = result.get("summary", "Review complete.")
     suggestions = result.get("suggestions", [])
     stats = result.get("stats", {})
+    review_scope = result.get("review_scope", "full")
+    push_changed_files = result.get("push_changed_files", [])
     is_dry_run = result.get("dry_run", False) or os.environ.get("REVIEW_AGENT_DRY_RUN", "false").lower() == "true"
 
     changed_files = load_changed_files()
@@ -966,6 +985,9 @@ def main():
     )
 
     print("=== Posting Review ===")
+    print(f"Review scope: {review_scope}")
+    if review_scope == "incremental":
+        print(f"  Push-changed files: {push_changed_files}")
     print(f"Summary: {summary}")
     print(f"Suggestions: {len(suggestions)}")
     print(f"  Critical: {sum(1 for s in suggestions if s.get('severity') == 'critical')}")
@@ -997,6 +1019,7 @@ def main():
         pr_number, summary, suggestions, diff_line_sets, stats,
         changed_files=changed_files, diff_stats=diff_stats,
         diff_content=diff_text, config=config,
+        review_scope=review_scope, push_changed_files=push_changed_files,
     )
     print(f"=== Review Posting Complete (event: {event}) ===")
 

@@ -353,7 +353,7 @@ def get_diff(config: dict) -> str:
 
 
 def get_changed_files() -> list[str]:
-    """Get list of changed files."""
+    """Get list of changed files (full PR)."""
     files_path = Path("/tmp/changed-files.txt")
     if files_path.exists():
         return [f.strip() for f in files_path.read_text().strip().split("\n") if f.strip()]
@@ -369,6 +369,17 @@ def get_changed_files() -> list[str]:
         return []
 
 
+def get_push_changed_files() -> list[str] | None:
+    """Get list of files changed in this push only (incremental mode).
+
+    Returns None if not in incremental mode.
+    """
+    files_path = Path("/tmp/push-changed-files.txt")
+    if files_path.exists():
+        return [f.strip() for f in files_path.read_text().strip().split("\n") if f.strip()]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -380,7 +391,18 @@ def main():
 
     # 1. Get changed files and diff
     changed_files = get_changed_files()
-    print(f"Changed files: {len(changed_files)}")
+    push_changed_files = get_push_changed_files()
+    print(f"Changed files (full PR): {len(changed_files)}")
+
+    # Determine review scope
+    if push_changed_files is not None:
+        review_scope = "incremental"
+        # Use push files for scoping rule matching, blast radius, and spec discovery
+        scoped_files = push_changed_files
+        print(f"Incremental mode: {len(push_changed_files)} files changed in this push")
+    else:
+        review_scope = "full"
+        scoped_files = changed_files
 
     if not changed_files:
         print("No changed files found. Exiting.")
@@ -390,11 +412,11 @@ def main():
     diff = get_diff(config)
     print(f"Diff size: {len(diff)} chars")
 
-    # 2. Select applicable rules
-    rules = select_applicable_rules(changed_files, config)
+    # 2. Select applicable rules (scoped to push files in incremental mode)
+    rules = select_applicable_rules(scoped_files, config)
     print(f"Applicable rules: {[r['name'] for r in rules]}")
 
-    # 3. Discover spec/plan (3 levels)
+    # 3. Discover spec/plan (3 levels, scoped)
     pr_body = os.environ.get("PR_BODY", "")
     pr_title = os.environ.get("PR_TITLE", "")
     branch_name = os.environ.get("BRANCH_NAME", "")
@@ -407,20 +429,21 @@ def main():
         if spec_docs:
             print(f"Spec discovery (Level 2 - fuzzy match): {[d['path'] for d in spec_docs]}")
         else:
-            spec_docs = discover_spec_directory_map(changed_files, config)
+            spec_docs = discover_spec_directory_map(scoped_files, config)
             if spec_docs:
                 print(f"Spec discovery (Level 3 - directory map): {[d['path'] for d in spec_docs]}")
             else:
                 print("Spec discovery: No specs found")
 
-    # 4. Trace blast radius
-    blast_radius = trace_blast_radius(changed_files, config)
+    # 4. Trace blast radius (scoped to push files in incremental mode)
+    blast_radius = trace_blast_radius(scoped_files, config)
     if blast_radius:
         print(f"Blast radius: {[b['path'] for b in blast_radius]}")
 
     # 5. Assemble context
     context = {
         "skip": False,
+        "review_scope": review_scope,
         "changed_files": changed_files,
         "rules": rules,
         "spec_docs": spec_docs,
@@ -435,6 +458,9 @@ def main():
             "branding": config.get("branding", {}),
         },
     }
+
+    if push_changed_files is not None:
+        context["push_changed_files"] = push_changed_files
 
     OUTPUT_PATH.write_text(json.dumps(context, indent=2, ensure_ascii=False))
     print(f"Context written to {OUTPUT_PATH} ({OUTPUT_PATH.stat().st_size} bytes)")

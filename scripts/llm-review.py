@@ -347,7 +347,7 @@ def build_system_prompt(context: dict, config: dict) -> str:
 
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
-    return f"""You are a senior software engineer reviewing {identity}.
+    prompt = f"""You are a senior software engineer reviewing {identity}.
 
 Today's date is {today}. Use this when evaluating dates in code or documentation — do NOT flag dates as "future" if they are on or before today.
 
@@ -494,14 +494,38 @@ Allowed severity values: "critical", "warning", "suggestion", "praise"
 
 If code is solid: {{"summary": "Clean PR, ship it!", "suggestions": []}}"""
 
+    # Incremental review scope adjustment
+    if context.get("review_scope") == "incremental":
+        push_files = context.get("push_changed_files", [])
+        file_list = "\n".join(f"- {f}" for f in push_files)
+        return (
+            f"**This is an incremental review of a follow-up push.** "
+            f"Focus your review on these files that changed in this push:\n{file_list}\n\n"
+            f"The full PR diff is provided for context only — do not re-review files that haven't changed in this push. "
+            f"Only post suggestions for the files listed above.\n\n"
+        ) + prompt
+
+    return prompt
+
 
 def build_user_message(context: dict) -> str:
     """Build the initial user message with just the diff."""
     parts = []
+    is_incremental = context.get("review_scope") == "incremental"
 
-    parts.append("## Changed Files")
-    for f in context["changed_files"]:
-        parts.append(f"- {f}")
+    if is_incremental:
+        push_files = context.get("push_changed_files", [])
+        parts.append("## Files Changed in This Push (review these)")
+        for f in push_files:
+            parts.append(f"- {f}")
+        parts.append("")
+        parts.append("## All PR Files (for context only)")
+        for f in context["changed_files"]:
+            parts.append(f"- {f}")
+    else:
+        parts.append("## Changed Files")
+        for f in context["changed_files"]:
+            parts.append(f"- {f}")
     parts.append("")
 
     parts.append("## PR Info")
@@ -515,11 +539,19 @@ def build_user_message(context: dict) -> str:
     parts.append("```")
 
     parts.append("")
-    parts.append(
-        "Review this diff. Examine every changed file — do not skip any. "
-        "Use tools to investigate anything that needs context. "
-        "When you have reviewed all files, return your final JSON review."
-    )
+    if is_incremental:
+        push_files = context.get("push_changed_files", [])
+        parts.append(
+            "This is an incremental review. Focus on the files changed in this push. "
+            "Use tools to investigate anything that needs context. "
+            "When you have reviewed all push-changed files, return your final JSON review."
+        )
+    else:
+        parts.append(
+            "Review this diff. Examine every changed file — do not skip any. "
+            "Use tools to investigate anything that needs context. "
+            "When you have reviewed all files, return your final JSON review."
+        )
 
     return "\n".join(parts)
 
@@ -755,12 +787,15 @@ def live_review(context: dict, config: dict):
 
     messages = [{"role": "user", "content": user_message}]
     changed_files = context.get("changed_files", [])
-    max_rounds = compute_max_tool_rounds(len(changed_files))
+    # In incremental mode, scope coverage checks to push-changed files only
+    review_files = context.get("push_changed_files", changed_files) if context.get("review_scope") == "incremental" else changed_files
+    max_rounds = compute_max_tool_rounds(len(review_files))
     files_read: set[str] = set()
     coverage_followup_sent = False
 
     print(f"=== Agentic Review ({MODEL}) ===")
-    print(f"  Changed files: {len(changed_files)}, max rounds: {max_rounds}")
+    scope_label = f"incremental ({len(review_files)} push files)" if context.get("review_scope") == "incremental" else "full"
+    print(f"  Scope: {scope_label}, changed files: {len(changed_files)}, max rounds: {max_rounds}")
     total_input_tokens = 0
     total_output_tokens = 0
     tool_calls = 0
@@ -830,7 +865,7 @@ def live_review(context: dict, config: dict):
             preliminary = _extract_json(raw_text)
 
             if preliminary and not coverage_followup_sent:
-                missed = check_file_coverage(changed_files, files_read, preliminary)
+                missed = check_file_coverage(review_files, files_read, preliminary)
                 if missed:
                     print(f"  Coverage gap: {len(missed)} files unreviewed — sending follow-up")
                     coverage_followup_sent = True
@@ -922,6 +957,11 @@ def live_review(context: dict, config: dict):
         "duration_ms": round(elapsed_ms),
         "cost_estimate": round(input_cost + output_cost, 4),
     }
+
+    # Propagate review scope info for post-review.py
+    result["review_scope"] = context.get("review_scope", "full")
+    if context.get("push_changed_files"):
+        result["push_changed_files"] = context["push_changed_files"]
 
     OUTPUT_PATH.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"Summary: {result.get('summary', 'N/A')}")
