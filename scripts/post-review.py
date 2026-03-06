@@ -211,18 +211,34 @@ def has_test_regression_risk(
     return False, None
 
 
+def _filter_safe_paths(changed_files: list[str], config: dict) -> list[str]:
+    """Remove files in auto_approve_safe_paths from risk evaluation."""
+    safe_paths = config.get("review", {}).get("auto_approve_safe_paths", [])
+    if not safe_paths:
+        return changed_files
+    return [f for f in changed_files if not any(sp in f for sp in safe_paths)]
+
+
 def needs_human_review(changed_files: list[str], diff_stats: dict,
                        diff_content: str, suggestions: list[dict],
                        config: dict) -> tuple[bool, list[str]]:
-    """Master decision: does this PR need a human reviewer?"""
+    """Master decision: does this PR need a human reviewer?
+
+    Files matching review.auto_approve_safe_paths are excluded from risk
+    checks. If all changed files are in safe paths, the PR is auto-approved.
+    """
+    risk_files = _filter_safe_paths(changed_files, config)
+    if not risk_files:
+        return False, []
+
     reasons = []
     for check_fn, args in [
-        (has_structural_risk, (changed_files, config)),
-        (has_security_risk, (changed_files, diff_content, config)),
-        (has_complexity_risk, (changed_files, diff_stats, suggestions, config)),
-        (has_model_risk, (changed_files, config)),
-        (has_api_risk, (changed_files, config)),
-        (has_test_regression_risk, (changed_files, diff_content, config)),
+        (has_structural_risk, (risk_files, config)),
+        (has_security_risk, (risk_files, diff_content, config)),
+        (has_complexity_risk, (risk_files, diff_stats, suggestions, config)),
+        (has_model_risk, (risk_files, config)),
+        (has_api_risk, (risk_files, config)),
+        (has_test_regression_risk, (risk_files, diff_content, config)),
     ]:
         is_risky, reason = check_fn(*args)
         if is_risky:

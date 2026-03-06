@@ -75,6 +75,8 @@ review:
   max_tokens: 8192
   max_tool_rounds: 10
   auto_approve_enabled: true
+  auto_approve_safe_paths: []            # Files here bypass risk checks for auto-approve
+                                         # e.g., ["agents/v2/", "tests/agents/v2/"]
   max_diff_lines: 1500
   max_blast_radius_files: 10
   max_rule_files: 25
