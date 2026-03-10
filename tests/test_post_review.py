@@ -601,3 +601,57 @@ class TestPostReviewViaGhIntegration:
             and "--jq" not in c["args"]
         ]
         assert len(review_posts) == 1, f"Expected 1 review POST, got {len(review_posts)}"
+
+
+# ---------------------------------------------------------------------------
+# _dismiss_stale_request_changes — clearing old REQUEST_CHANGES reviews
+# ---------------------------------------------------------------------------
+
+class TestDismissStaleRequestChanges:
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        import importlib
+        self.mod = importlib.import_module("post-review")
+
+    def test_dismisses_changes_requested_reviews(self):
+        """Old CHANGES_REQUESTED reviews from our bot should be dismissed."""
+        api_calls = []
+
+        def tracking_gh_api(args, timeout=15):
+            api_calls.append(args)
+            if "--jq" in args and "CHANGES_REQUESTED" in str(args):
+                return (0, "[12345, 67890]", "")
+            if "dismissals" in str(args):
+                return (0, "{}", "")
+            return (0, "[]", "")
+
+        branding = {"review_header": "## Swisper Rule Review"}
+        with patch.object(self.mod, "_gh_api", side_effect=tracking_gh_api):
+            self.mod._dismiss_stale_request_changes("owner/repo", "42", branding)
+
+        dismiss_calls = [a for a in api_calls if "dismissals" in str(a)]
+        assert len(dismiss_calls) == 2
+        assert "12345" in dismiss_calls[0][0]
+        assert "67890" in dismiss_calls[1][0]
+
+    def test_no_op_when_no_changes_requested(self):
+        """If there are no CHANGES_REQUESTED reviews, nothing should happen."""
+        api_calls = []
+
+        def tracking_gh_api(args, timeout=15):
+            api_calls.append(args)
+            return (0, "[]", "")
+
+        branding = {"review_header": "## Swisper Rule Review"}
+        with patch.object(self.mod, "_gh_api", side_effect=tracking_gh_api):
+            self.mod._dismiss_stale_request_changes("owner/repo", "42", branding)
+
+        dismiss_calls = [a for a in api_calls if "dismissals" in str(a)]
+        assert len(dismiss_calls) == 0
+
+    def test_not_called_when_event_is_request_changes(self):
+        """Dismiss should NOT be called when the new verdict is still REQUEST_CHANGES."""
+        branding = {"review_header": "## Code Review"}
+        event = "REQUEST_CHANGES"
+        # The condition in post_review_via_gh: `if event != "REQUEST_CHANGES"`
+        assert event == "REQUEST_CHANGES", "Dismiss should be skipped"

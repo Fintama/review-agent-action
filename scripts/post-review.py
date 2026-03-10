@@ -641,6 +641,45 @@ def _delete_pending_review(repo: str, pr_number: str):
         print(f"  Deleted pending review ({review_id})")
 
 
+def _dismiss_stale_request_changes(repo: str, pr_number: str, branding: dict):
+    """Dismiss old REQUEST_CHANGES reviews from our bot.
+
+    GitHub keeps REQUEST_CHANGES as the active review state until explicitly
+    dismissed. When all critical comments have been addressed in a subsequent
+    push, we must dismiss the old review so the PR is no longer blocked.
+    """
+    review_header = branding.get("review_header", "## Code Review")
+    rc, stdout, _ = _gh_api([
+        f"repos/{repo}/pulls/{pr_number}/reviews",
+        "--jq", f'[.[] | select(.state == "CHANGES_REQUESTED" and (.body | contains("{review_header}"))) | .id]',
+    ])
+    if rc != 0 or not stdout.strip():
+        return
+
+    try:
+        review_ids = json.loads(stdout) if stdout.strip() else []
+    except json.JSONDecodeError:
+        return
+
+    dismissed = 0
+    for review_id in review_ids:
+        if dismissed >= MAX_CLEANUP_OPS:
+            break
+        payload = {"message": "All critical findings have been addressed in subsequent commits.", "event": "DISMISS"}
+        payload_path = Path("/tmp/dismiss-review-payload.json")
+        payload_path.write_text(json.dumps(payload, ensure_ascii=False))
+        drc, _, stderr = _gh_api([
+            f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+            "--input", str(payload_path), "--method", "PUT",
+        ])
+        if drc == 0:
+            dismissed += 1
+        else:
+            print(f"  Warning: Failed to dismiss review {review_id}: {stderr[:100]}")
+    if dismissed:
+        print(f"  Dismissed {dismissed} stale REQUEST_CHANGES review(s)")
+
+
 def _get_head_commit(repo: str, pr_number: str) -> str | None:
     """Get the HEAD commit SHA for a PR."""
     rc, stdout, _ = _gh_api([
@@ -949,10 +988,9 @@ def post_review_via_gh(
                 event = "REQUEST_CHANGES"
                 event_reasons = ["Outstanding critical from previous review not yet addressed"]
                 print(f"  Overriding verdict to REQUEST_CHANGES (outstanding critical)")
-            elif has_outstanding_warning and event == "APPROVE":
-                event = "COMMENT"
-                event_reasons = ["Outstanding warning(s) from previous review not yet addressed"]
-                print(f"  Overriding verdict to COMMENT (outstanding warning)")
+            elif has_outstanding_warning:
+                # Warnings are informational — don't block approval
+                print(f"  Outstanding warning(s) noted but not blocking approval")
     elif existing_comments:
         # Full mode: delete all old comments (they'll be replaced)
         deleted = 0
@@ -962,8 +1000,10 @@ def post_review_via_gh(
         if deleted:
             print(f"  Deleted {deleted} old inline comment(s)")
 
-    # Step 3: Minimize old reviews
+    # Step 3: Minimize old reviews and dismiss stale REQUEST_CHANGES
     _minimize_old_reviews(repo, pr_number, branding)
+    if event != "REQUEST_CHANGES":
+        _dismiss_stale_request_changes(repo, pr_number, branding)
 
     # Step 4: Upsert summary
     summary_body = build_summary_body(
